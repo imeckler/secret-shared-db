@@ -4,6 +4,7 @@ use ark_ec::{
     AffineRepr, CurveGroup, VariableBaseMSM,
     scalar_mul::glv::GLVConfig,
     short_weierstrass::{Affine as SWAffine, Projective as SWProjective, SWCurveConfig},
+    twisted_edwards::Projective,
 };
 use ark_ff::{AdditiveGroup, BigInteger, Field, PrimeField, UniformRand, Zero};
 use ark_serialize::CanonicalSerialize;
@@ -23,6 +24,20 @@ pub struct MsmProof<F, G> {
     lr: Vec<(Commitment<G>, Commitment<G>)>,
     a: F,
     schnorr: Commitment<(G, F)>,
+}
+
+fn commitment_key_scalars<F: Field>(chals: &[F]) -> Vec<F> {
+    let rounds = chals.len();
+    let s_length = 1 << rounds;
+    let mut s = vec![F::one(); s_length];
+    let mut k: usize = 0;
+    let mut pow: usize = 1;
+    for i in 1..s_length {
+        k += if i == pow { 1 } else { 0 };
+        pow <<= if i == pow { 1 } else { 0 };
+        s[i] = s[i - (pow >> 1)] * chals[rounds - 1 - (k - 1)];
+    }
+    s
 }
 
 fn absorb_curve<P: SWCurveConfig, S: CryptographicSponge>(sponge: &mut S, g: SWAffine<P>) {
@@ -66,11 +81,10 @@ impl<P: SWCurveConfig + GLVConfig> CommitmentKey<P> {
         proof: &MsmProof<P::ScalarField, SWAffine<P>>,
         Commitment(c1, c2): Commitment<SWAffine<P>>,
     ) -> bool {
-        let mut g = self.g.clone();
-        let mut h = self.h.clone();
         let mut c1 = c1.into_group();
         let mut c2 = c2.into_group();
 
+        let mut chal_invs = vec![];
         for (Commitment(l1, l2), Commitment(r1, r2)) in proof.lr.iter() {
             absorb_curve(sponge, *l1);
             absorb_curve(sponge, *l2);
@@ -80,23 +94,26 @@ impl<P: SWCurveConfig + GLVConfig> CommitmentKey<P> {
             let x_inv = sponge.squeeze_bits(128);
             let x_inv_field = endoscalar_to_field::<P>(&x_inv[..]);
             let x = x_inv_field.inverse().unwrap();
-
-            let m = g.len() / 2;
-            g = affine_window_combine_one_endo(P::ENDO_COEFFS[0], &g[..m], &g[m..], &x_inv);
-            h = affine_window_combine_one_endo(P::ENDO_COEFFS[0], &h[..m], &h[m..], &x_inv);
+            chal_invs.push(x_inv_field);
 
             c1 += *l1 * x;
             c1 += *r1 * x_inv_field;
             c2 += *l2 * x;
             c2 += *r2 * x_inv_field;
         }
-        assert_eq!(g.len(), 1);
-        assert_eq!(h.len(), 1);
+        let ss = commitment_key_scalars(&chal_invs);
+        let g0 = <SWProjective<P> as VariableBaseMSM>::msm(&self.g[..], &ss[..])
+            .unwrap()
+            .into_affine();
+        let h0 = <SWProjective<P> as VariableBaseMSM>::msm(&self.h[..], &ss[..])
+            .unwrap()
+            .into_affine();
+
         // basically checking
-        // g[0] * proof.a == c1 && h[0] * proof.a == c2
+        // g0 * proof.a == c1 && h0 * proof.a == c2
         // instead checking that
-        // c1 - g[0] * proof.a is a multiple of self.blinder
-        // AND c2 - h[0] * proof.a is a multiple of self.blinder
+        // c1 - g0 * proof.a is a multiple of self.blinder
+        // AND c2 - h0 * proof.a is a multiple of self.blinder
 
         let Commitment((u1, z1), (u2, z2)) = proof.schnorr;
 
@@ -106,8 +123,8 @@ impl<P: SWCurveConfig + GLVConfig> CommitmentKey<P> {
 
         let c: Vec<P::ScalarField> = sponge.squeeze_field_elements(2);
 
-        (c1 - g[0] * proof.a) * c[0] + u1 == self.blinder * z1
-            && (c2 - h[0] * proof.a) * c[1] + u2 == self.blinder * z2
+        (c1 - g0 * proof.a) * c[0] + u1 == self.blinder * z1
+            && (c2 - h0 * proof.a) * c[1] + u2 == self.blinder * z2
     }
 
     /// Instance:
