@@ -17,7 +17,7 @@
 
 use ark_ec::{
     AdditiveGroup, AffineRepr, CurveGroup, models::short_weierstrass::Affine as SWJAffine,
-    short_weierstrass::SWCurveConfig,
+    scalar_mul::glv::GLVConfig, short_weierstrass::SWCurveConfig,
 };
 use ark_ff::{BitIteratorBE, Field, One, PrimeField, Zero};
 use itertools::Itertools;
@@ -86,7 +86,7 @@ fn add_pairs_in_place<P: SWCurveConfig>(pairs: &mut Vec<SWJAffine<P>>) {
 /// assuming that for each `i`, `v0[i].x != v1[i].x` so we can use the ordinary
 /// addition formula and don't have to handle the edge cases of doubling and
 /// hitting the point at infinity.
-fn batch_add_assign_no_branch<P: SWCurveConfig>(
+pub fn batch_add_assign_no_branch<P: SWCurveConfig>(
     denominators: &mut [P::BaseField],
     v0: &mut [SWJAffine<P>],
     v1: &[SWJAffine<P>],
@@ -290,7 +290,7 @@ fn batch_endo_in_place<P: SWCurveConfig>(endo_coeff: P::BaseField, ps: &mut [SWJ
     ps.par_iter_mut().for_each(|p| p.x *= endo_coeff);
 }
 
-fn batch_negate_in_place<P: SWCurveConfig>(ps: &mut [SWJAffine<P>]) {
+pub fn batch_negate_in_place<P: SWCurveConfig>(ps: &mut [SWJAffine<P>]) {
     ps.par_iter_mut().for_each(|p| {
         p.y = -p.y;
     });
@@ -298,6 +298,75 @@ fn batch_negate_in_place<P: SWCurveConfig>(ps: &mut [SWJAffine<P>]) {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScalarChallenge<F>(F);
+
+pub fn batch_glv_mul<P: GLVConfig>(p: &[SWJAffine<P>], k: P::ScalarField) -> Vec<SWJAffine<P>> {
+    const CHUNK_SIZE: usize = 4096;
+    let p = p.chunks(CHUNK_SIZE).collect_vec();
+    let v: Vec<_> = p
+        .into_par_iter()
+        .map(|p| batch_glv_mul_base(p, k))
+        .collect();
+    v.concat()
+}
+
+pub fn batch_glv_mul_base<P: GLVConfig>(
+    p: &[SWJAffine<P>],
+    k: P::ScalarField,
+) -> Vec<SWJAffine<P>> {
+    let mut denominators = vec![P::BaseField::zero(); p.len()];
+
+    let ((sgn_k1, k1), (sgn_k2, k2)) = P::scalar_decomposition(k);
+
+    let mut b1 = p.to_vec();
+    let mut b2 = p.to_vec();
+    batch_endo_in_place(P::ENDO_COEFFS[0], &mut b2);
+
+    if !sgn_k1 {
+        batch_negate_in_place(&mut b1);
+    }
+    if !sgn_k2 {
+        batch_negate_in_place(&mut b2);
+    }
+
+    let mut b1b2 = b1.clone();
+    batch_add_assign_no_branch(&mut denominators, &mut b1b2, &b2);
+
+    let iter_k1 = ark_ff::BitIteratorBE::new(k1.into_bigint());
+    let iter_k2 = ark_ff::BitIteratorBE::new(k2.into_bigint());
+
+    let mut res_initialized = false;
+    let mut skip_zeros = true;
+    // Start offs as "zero".
+    // Since there is no affine representation of zero, we start with dummy values
+    // and will clobber on first non-trivial iteration of the loop
+    let mut res = vec![b1[0]; b1.len()];
+    for pair in iter_k1.zip(iter_k2) {
+        if skip_zeros && pair == (false, false) {
+            continue;
+        }
+        skip_zeros = false;
+
+        if res_initialized {
+            batch_double_in_place(&mut denominators, &mut res);
+            match pair {
+                (true, false) => batch_add_assign_no_branch(&mut denominators, &mut res, &b1),
+                (false, true) => batch_add_assign_no_branch(&mut denominators, &mut res, &b2),
+                (true, true) => batch_add_assign_no_branch(&mut denominators, &mut res, &b1b2),
+                (false, false) => {}
+            }
+        } else {
+            let (x, y) = pair;
+            res_initialized = x || y;
+            match pair {
+                (true, false) => res.copy_from_slice(&b1),
+                (false, true) => res.copy_from_slice(&b2),
+                (true, true) => res.copy_from_slice(&b1b2),
+                (false, false) => (),
+            };
+        }
+    }
+    res
+}
 
 /// <D-O><D-I>
 /// Uses a batch version of Algorithm 1 of
@@ -323,7 +392,7 @@ fn affine_window_combine_one_endo_base<P: SWCurveConfig>(
 
     let mut tmp_s = g2.to_vec();
     let mut tmp_acc = g2.to_vec();
-    for i in (0..(128 / 2)).rev() {
+    for i in (0..(r.len() / 2)).rev() {
         // s = g2
         assign(&mut tmp_s, g2);
         // tmp = acc
@@ -347,7 +416,7 @@ fn affine_window_combine_one_endo_base<P: SWCurveConfig>(
 }
 
 /// Double an array of curve points in-place.
-fn batch_double_in_place<P: SWCurveConfig>(
+pub fn batch_double_in_place<P: SWCurveConfig>(
     denominators: &mut Vec<P::BaseField>,
     points: &mut [SWJAffine<P>],
 ) {
