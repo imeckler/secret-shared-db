@@ -20,7 +20,6 @@ mod combine;
 mod dlog_table;
 mod ipa;
 mod lagrange;
-mod prss;
 // mod schnorr;
 mod epoch;
 mod secret_sharing;
@@ -141,8 +140,8 @@ fn main() {
     let mut rng = ark_std::rand::rngs::StdRng::from_seed([0; 32]);
     use crate::snark::*;
 
-    let num_parties = 3;
-    let threshold = 2;
+    let num_parties = 5;
+    let threshold = 3;
     let encryption_params = EncryptionParams {
         public_key_base: random_group_element(b"public_key_base", 0),
     };
@@ -160,7 +159,7 @@ fn main() {
     let public_keys = Projective::normalize_batch(&public_keys);
 
     let start = Instant::now();
-    let (encryption, proof) = encrypt(
+    let encrypted_with_proof = encrypt(
         &encryption_params,
         &bitpacking_ipa_params,
         &dlog_table,
@@ -168,110 +167,24 @@ fn main() {
         &public_keys,
         &mut rng,
     );
+
     println!("encryption/proving {:?}", start.elapsed());
 
-    let m: usize = 1 << 1;
-    let n: usize = 3;
-
-    let params: EncryptionParams<_> = EncryptionParams {
-        public_key_base: Affine::rand(&mut rng),
-        commitment_base: Affine::rand(&mut rng),
-    };
-
-    let secret_keys: Vec<_> = (0..n).map(|_i| Fr::rand(&mut rng)).collect();
-    let public_keys: Vec<_> = secret_keys
-        .par_iter()
-        .map(|k| params.public_key_base * k)
-        .collect();
-    let public_keys = Projective::normalize_batch(&public_keys);
-
-    let secrets: Shares<Fr> = Shares::create(&mut rng, n, 2, m);
-    let limbs = secrets.to_limbs();
-    let z = Fr::rand(&mut rng);
-    println!("start");
-    let start = Instant::now();
-    let encryption = encrypt(&params, &limbs, &public_keys, z, &mut rng);
-    println!("encryption {:?}", start.elapsed());
-
-    let table = DLogTable::create(params.commitment_base);
-
-    let single_party = SinglePartyEncryptedShares {
-        randomness: encryption.randomness.clone(),
-        by_limb: encryption.per_party[0].clone(),
-    };
-    let start = Instant::now();
-    let decrypted = decrypt(&single_party, &table, secret_keys[0], z);
-    println!("decryption {:?}", start.elapsed());
-    for (i, (x, y)) in decrypted
-        .iter()
-        .zip(secrets.per_party[0].iter())
-        .enumerate()
-    {
-        assert_eq!((i, *x), (i, *y));
+    for i in 0..1 {
+        let start = Instant::now();
+        let decrypted = encrypted_with_proof
+            .decrypt_and_verify(
+                &encryption_params,
+                &bitpacking_ipa_params,
+                &dlog_table,
+                secret_keys[i],
+                i,
+                &public_keys,
+            )
+            .unwrap();
+        println!("decryption/verifying {:?}", start.elapsed());
+        assert_eq!(decrypted, shares.per_party[i])
     }
-
-    let xs: Vec<_> = (0..m)
-        .into_par_iter()
-        .map(|i| Fr::rand(&mut StdRng::from_seed(usize_to_seed(i))))
-        .collect();
-
-    let gs: Vec<_> = (0..m)
-        .into_par_iter()
-        .map(|i| Affine::rand(&mut StdRng::from_seed(usize_to_seed(i))))
-        .collect();
-    let hs: Vec<_> = (0..m)
-        .into_par_iter()
-        .map(|i| Affine::rand(&mut StdRng::from_seed(usize_to_seed(m + i))))
-        .collect();
-
-    let ck = CommitmentKey {
-        g: gs.clone(),
-        h: hs.clone(),
-        blinder: Affine::rand(&mut StdRng::from_seed(usize_to_seed(2 * m))),
-    };
-    let mut rng = StdRng::from_seed(usize_to_seed(3 * m));
-    let mut sponge = ShakeSponge::new(&());
-
-    let start = Instant::now();
-    println!("{start:?}");
-    let proof = ck.prove(&mut rng, &mut sponge, xs.clone());
-    println!("{:?}", start.elapsed());
-
-    let multiscale = Instant::now();
-    let alpha = xs[0];
-    /*
-        let chunk_size = 1usize << 10;
-        let shift = alpha.pow(&[chunk_size as u64]);
-        let mut res: Vec<_> = pows(alpha)
-            .take(chunk_size)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|x| PallasConfig::glv_mul_affine(gs[0], x))
-            .collect();
-        for _ in 0..gs.len() / chunk_size {
-            let prev_chunk = &res[res.len() - chunk_size..];
-            batch_glv_mul(prev_chunk, shift);
-        }
-    */
-    println!("{:?}", multiscale.elapsed());
-
-    let mut sponge = ShakeSponge::new(&());
-    let c1 = Projective::msm(&gs[..], &xs[..]).unwrap().into_affine();
-    let c2 = Projective::msm(&hs[..], &xs[..]).unwrap().into_affine();
-    println!("{}", ck.verify(&mut sponge, &proof, Commitment(c1, c2)));
-    println!("{:?}", start.elapsed());
-    println!(
-        "{}",
-        ck.verify(
-            &mut sponge,
-            &proof,
-            Commitment(c1.into_group().double().into_affine(), c2)
-        )
-    );
-    println!("{:?}", start.elapsed());
-    println!("{}", ck.verify(&mut sponge, &proof, Commitment(c1, c1)));
-    // let res = G1Projective::msm(&gs[..], &xs[..]);
-    println!("{:?}", start.elapsed());
 }
 
 fn transpose<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
