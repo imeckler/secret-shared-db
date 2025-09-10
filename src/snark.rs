@@ -32,7 +32,7 @@
 // inner product to link with the limbs
 
 use core::num;
-use std::time::Instant;
+use std::{str::FromStr, time::Instant};
 
 use ark_crypto_primitives::sponge::{self, CryptographicSponge};
 use ark_ec::{
@@ -48,7 +48,10 @@ use array_init::array_init;
 use itertools::{Itertools, assert_equal};
 use rand::random;
 use rayon::{array, prelude::*};
-use sha2::digest::{generic_array::arr, typenum::bit};
+use sha2::digest::{
+    generic_array::arr,
+    typenum::{Bit, bit},
+};
 use tiny_keccak::{Hasher, Shake};
 
 use crate::{
@@ -65,6 +68,41 @@ const LIMBS: usize = 16;
 const LIMB_SIZE: usize = 256 / 16;
 const BYTES_PER_LIMB: usize = LIMB_SIZE / 8;
 const SECRETS: usize = 2;
+
+pub struct SharePolynomials<F: Field>([DensePolynomial<F>; SECRETS]);
+
+impl<F: PrimeField> SharePolynomials<F> {
+    pub fn create<R: RngCore>(rng: &mut R, threshold: usize) -> Self {
+        Self(array_init(|_| {
+            let mut p = DensePolynomial::<F>::rand(threshold - 1, rng);
+            p.coeffs[0] = F::zero();
+            p
+        }))
+    }
+
+    pub fn shares(&self, num_parties: usize) -> Shares<F> {
+        let pts = evaluation_points::<F>(num_parties);
+        let per_party = (0..num_parties)
+            .map(|i| array_init(|k| self.0[k].evaluate(&pts[i][k])))
+            .collect_vec();
+        Shares { per_party }
+    }
+
+    fn commitments<P: SWCurveConfig<ScalarField = F>, R: RngCore>(
+        &self,
+        rng: &mut R,
+        ipa_params: &IPAParams<P>,
+    ) -> [(Affine<P>, F); SECRETS] {
+        array_init(|i| {
+            let r: F = F::rand(rng);
+
+            let g =
+                <Projective<P> as VariableBaseMSM>::msm_unchecked(&ipa_params.h, &self.0[i].coeffs)
+                    + ipa_params.blinder_base * r;
+            (g.into_affine(), r)
+        })
+    }
+}
 
 pub struct Shares<F> {
     pub per_party: Vec<[F; 2]>,
@@ -107,21 +145,6 @@ impl<F: PrimeField> Shares<F> {
             .collect();
         ShareLimbs { per_party }
     }
-
-    pub fn create<R: RngCore>(rng: &mut R, num_parties: usize, threshold: usize) -> Self {
-        let mut per_party: Vec<[F; 2]> = vec![[F::zero(); 2]; num_parties];
-        let pts = evaluation_points::<F>(num_parties);
-
-        for k in 0..SECRETS {
-            let mut p = DensePolynomial::<F>::rand(threshold - 1, rng);
-            p.coeffs[0] = F::zero();
-
-            for i in 0..num_parties {
-                per_party[i][k] = p.evaluate(&pts[i][k])
-            }
-        }
-        Shares { per_party }
-    }
 }
 
 pub struct EncryptedShares<P: SWCurveConfig> {
@@ -148,8 +171,15 @@ struct ProofColumns<C> {
     lookup_counts: C,
 }
 
+struct EvaluationIPA<P: SWCurveConfig> {
+    lr: Vec<(Affine<P>, Affine<P>)>,
+    schnorr: Schnorr<3, P>,
+}
+
 struct Proof<P: SWCurveConfig> {
     bit_packing: BitpackingIPA<P>,
+    polynomials: [Affine<P>; SECRETS],
+    evaluation: [EvaluationIPA<P>; SECRETS],
 }
 
 pub struct EncryptedSharesWithProof<P: SWCurveConfig> {
@@ -161,13 +191,14 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
     pub fn decrypt_and_verify(
         &self,
         encryption_params: &EncryptionParams<Affine<P>>,
-        bitpacking_ipa_params: &BitPackingIPAParams<P>,
+        ipa_params: &IPAParams<P>,
         table: &DLogTable<P>,
         secret_key: P::ScalarField,
         i: usize,
         public_keys: &Vec<Affine<P>>,
+        threshold: usize,
     ) -> Option<[P::ScalarField; 2]> {
-        if self.verify(encryption_params, bitpacking_ipa_params, public_keys) {
+        if self.verify(encryption_params, ipa_params, public_keys, threshold) {
             let shares: SinglePartyEncryptedShares<Affine<P>> = SinglePartyEncryptedShares {
                 by_limb: &self.shares.per_party[i],
                 randomness: &self.shares.randomness,
@@ -182,18 +213,64 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
     pub fn verify(
         &self,
         encryption_params: &EncryptionParams<Affine<P>>,
-        bitpacking_ipa_params: &BitPackingIPAParams<P>,
+        ipa_params: &IPAParams<P>,
         public_keys: &Vec<Affine<P>>,
+        threshold: usize,
     ) -> bool {
+        let num_parties = public_keys.len();
         let mut sponge = ShakeSponge::new(&());
 
-        bitpacking_ipa_params.verify(
+        let sponge = &mut sponge;
+        self.shares
+            .randomness
+            .iter()
+            .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, r)));
+        self.shares.per_party.iter().for_each(|p| {
+            p.iter()
+                .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, s)))
+        });
+        self.proof
+            .polynomials
+            .iter()
+            .for_each(|g| absorb_curve(sponge, g));
+        absorb_curve(sponge, &self.proof.bit_packing.bit_commitment);
+
+        let chals = Challenges::create(sponge);
+
+        let combined_public_key = chals.combined_public_key(public_keys).into_affine();
+
+        if !self.proof.bit_packing.verify(
+            ipa_params,
             encryption_params,
-            &mut sponge,
+            sponge,
             &self.shares,
-            public_keys,
-            &self.proof.bit_packing,
-        )
+            num_parties,
+            combined_public_key,
+            &chals,
+        ) {
+            return false;
+        }
+
+        for (k, e) in self.proof.evaluation.iter().enumerate() {
+            println!("V poly eval {k}");
+            if !e.verify(
+                ipa_params,
+                self.proof.polynomials[k],
+                k,
+                threshold,
+                chals.alpha,
+                &self.shares,
+                encryption_params,
+                public_keys,
+                combined_public_key,
+                sponge,
+            ) {
+                return false;
+            }
+        }
+
+        true
+        // TODO: Absorb the polynomial commitments
     }
 }
 
@@ -209,14 +286,14 @@ fn map2<A: Copy, B: Copy, C, F: Fn(A, B) -> C, const N: usize>(
     array_init(|i| f(xs[i], ys[i]))
 }
 
-struct BitpackingIPAChallenges<P: SWCurveConfig> {
+struct Challenges<P: SWCurveConfig> {
     alpha: P::ScalarField,
     beta: P::ScalarField,
     gamma: P::ScalarField,
     delta: P::ScalarField,
 }
 
-impl<P: SWCurveConfig> BitpackingIPAChallenges<P> {
+impl<P: SWCurveConfig> Challenges<P> {
     fn combined_public_key(&self, public_keys: &Vec<Affine<P>>) -> Projective<P> {
         <Projective<P> as VariableBaseMSM>::msm(
             public_keys,
@@ -225,8 +302,18 @@ impl<P: SWCurveConfig> BitpackingIPAChallenges<P> {
         .unwrap()
     }
 
+    fn create<S: CryptographicSponge>(sponge: &mut S) -> Self {
+        let x = sponge.squeeze_field_elements::<P::ScalarField>(4);
+        Self {
+            alpha: x[0],
+            beta: x[1],
+            gamma: x[2],
+            delta: x[3],
+        }
+    }
+
     fn bit_packing_coefficients(&self, num_parties: usize) -> Vec<P::ScalarField> {
-        let BitpackingIPAChallenges {
+        let Self {
             alpha,
             beta,
             gamma,
@@ -262,32 +349,56 @@ impl<P: SWCurveConfig> BitpackingIPAChallenges<P> {
     }
 }
 
-impl<P: GLVConfig> EncryptedShares<P> {
-    fn challenges<S: CryptographicSponge>(&self, sponge: &mut S) -> BitpackingIPAChallenges<P> {
-        self.randomness
-            .iter()
-            .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, r)));
-        self.per_party.iter().for_each(|p| {
-            p.iter()
-                .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, s)))
-        });
-        let x = sponge.squeeze_field_elements::<P::ScalarField>(4);
-        BitpackingIPAChallenges {
-            alpha: x[0],
-            beta: x[1],
-            gamma: x[2],
-            delta: x[3],
+struct BitsWithCommitment<P: SWCurveConfig> {
+    bits: Vec<P::ScalarField>,
+    comm: Affine<P>,
+    blinder: P::ScalarField,
+}
+
+impl ShareLimbs {
+    fn bits_with_commitment<P: GLVConfig, R: RngCore>(
+        &self,
+        ipa_params: &IPAParams<P>,
+        rng: &mut R,
+    ) -> BitsWithCommitment<P> {
+        let num_parties = self.per_party.len();
+        let mut bits: Vec<P::ScalarField> = vec![];
+        let bit_commitment_blinder = P::ScalarField::rand(rng);
+        // TODO: Use a batch affine version if efficiency is needed.
+        let mut bit_commitment = ipa_params.blinder_base * bit_commitment_blinder;
+        let mut idx = 0;
+        for i in 0..num_parties {
+            for j in 0..LIMBS {
+                for k in 0..2 {
+                    for l in 0..LIMB_SIZE {
+                        let b = (self.per_party[i][j][k] >> l) & 1;
+                        if b == 1 {
+                            bit_commitment += ipa_params.h[idx];
+                        }
+                        bits.push(P::ScalarField::from_bigint(b.into()).unwrap());
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        let bit_commitment = bit_commitment.into_affine();
+        BitsWithCommitment {
+            bits,
+            comm: bit_commitment,
+            blinder: bit_commitment_blinder,
         }
     }
+}
 
+impl<P: GLVConfig> EncryptedShares<P> {
     // \delta \sum_jk \beta^j \gamma^k R_jk + sum_ijk \alpha^i \beta^j \gamma^k C_ijk
-    fn combined_commitment(&self, chals: &BitpackingIPAChallenges<P>) -> Projective<P> {
-        let BitpackingIPAChallenges {
+    fn combined_commitment(&self, chals: &Challenges<P>) -> Projective<P> {
+        let Challenges {
             alpha,
             beta,
             gamma,
             delta,
-        } = chals;
+        } = &chals;
 
         let mut bases = vec![];
         let mut scalars = vec![];
@@ -359,19 +470,21 @@ pub fn decrypt<P: SWCurveConfig + GLVConfig>(
 
 pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
     params: &EncryptionParams<Affine<P>>,
-    bitpacking_ipa_params: &BitPackingIPAParams<P>,
+    ipa_params: &IPAParams<P>,
     // The table is a table of powers of ipa_params.inner_product_base
     table: &DLogTable<P>,
-    limbs: &ShareLimbs,
+    polynomials: &SharePolynomials<P::ScalarField>,
+    // limbs: &ShareLimbs,
     public_keys: &Vec<Affine<P>>,
     rng: &mut R,
 ) -> EncryptedSharesWithProof<P> {
-    let num_limbs = limbs.per_party[0].len();
-    println!("{num_limbs}");
+    let shares = polynomials.shares(public_keys.len());
+    let limbs = shares.to_limbs();
     let num_secrets = limbs.per_party[0][0].len();
-    println!("start rand");
+
     let rs: [[P::ScalarField; 2]; LIMBS] =
         array_init(|_j| array_init(|_k| P::ScalarField::rand(rng)));
+
     let randomness: [[_; 2]; LIMBS] = map(&rs, |v| {
         let res: Vec<Projective<_>> = v
             .par_iter()
@@ -400,21 +513,69 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
         per_party: shares,
     };
 
+    let poly_comms = polynomials.commitments(rng, ipa_params);
+
+    let bits = limbs.bits_with_commitment(ipa_params, rng);
+
     let mut sponge = ShakeSponge::new(&());
-    let (_bitpacking_chals, bitpacking_ipa) = bitpacking_ipa_params.prove(
-        limbs,
+    let sponge = &mut sponge;
+    encrypted_shares
+        .randomness
+        .iter()
+        .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, r)));
+    encrypted_shares.per_party.iter().for_each(|p| {
+        p.iter()
+            .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, s)))
+    });
+    poly_comms
+        .iter()
+        .for_each(|(g, _r)| absorb_curve(sponge, g));
+    absorb_curve(sponge, &bits.comm);
+
+    let chals = Challenges::create(sponge);
+    let num_parties = public_keys.len();
+    let combined_public_key = chals.combined_public_key(public_keys).into_affine();
+
+    let bitpacking_ipa = BitpackingIPA::create(
+        ipa_params,
         &rs,
-        &encrypted_shares,
-        &params,
-        public_keys,
-        &mut sponge,
+        params,
+        num_parties,
+        combined_public_key,
+        &chals,
+        &bits,
+        sponge,
         rng,
     );
+
+    let evaluation = array_init(|k| {
+        println!(
+            "poly {k} deg/len = {}/{}",
+            polynomials.0[k].degree(),
+            polynomials.0[k].coeffs.len()
+        );
+        println!("P poly eval {k}");
+        EvaluationIPA::create(
+            ipa_params,
+            &polynomials.0[k],
+            poly_comms[k].1,
+            k,
+            chals.alpha,
+            &rs,
+            params,
+            public_keys,
+            combined_public_key,
+            sponge,
+            rng,
+        )
+    });
 
     EncryptedSharesWithProof {
         shares: encrypted_shares,
         proof: Proof {
             bit_packing: bitpacking_ipa,
+            polynomials: map(&poly_comms, |(g, _)| g),
+            evaluation,
         },
     }
 }
@@ -436,10 +597,12 @@ pub struct IPAParams<P: SWCurveConfig> {
     pub inner_product_base: Affine<P>,
 }
 
+/*
 pub struct BitPackingIPAParams<P: SWCurveConfig> {
     pub ipa: IPAParams<P>,
     num_parties: usize,
 }
+*/
 
 pub struct PolynomialCommitmentIPAParams<P: SWCurveConfig> {
     ipa: IPAParams<P>,
@@ -520,7 +683,7 @@ fn commitment_key_scalars<F: Field>(chals: &[F]) -> Vec<F> {
 
 impl<P: SWCurveConfig + GLVConfig> IPAParams<P> {
     pub fn new(prefix: &[u8], n: usize) -> Self {
-        let n = n as u64;
+        let n = 1 << log2(n);
         let h = (0..n).map(|i| random_group_element(prefix, i)).collect();
         let blinder_base = random_group_element(prefix, n);
         let inner_product_base = random_group_element(prefix, n + 1);
@@ -532,64 +695,206 @@ impl<P: SWCurveConfig + GLVConfig> IPAParams<P> {
     }
 }
 
-impl<P: GLVConfig> BitPackingIPAParams<P> {
-    pub fn new(num_parties: usize) -> Self {
-        let prefix = b"bit_packing_ipa_param";
-        let num_bits = 1 << log2(num_parties * SECRETS * LIMBS * LIMB_SIZE);
-        BitPackingIPAParams {
-            ipa: IPAParams::new(prefix, num_bits),
-            num_parties,
+impl<P: GLVConfig> EvaluationIPA<P> {
+    fn schnorr_bases(
+        h0: Affine<P>,
+        public0: P::ScalarField,
+        inner_product_base: Affine<P>,
+        combined_public_key: Affine<P>,
+        blinder_base: Affine<P>,
+    ) -> [Affine<P>; 3] {
+        [
+            (h0 + inner_product_base * public0).into_affine(),
+            combined_public_key,
+            blinder_base,
+        ]
+    }
+
+    pub fn combined_powers(
+        num_parties: usize,
+        k: usize,
+        degree: usize,
+        alpha: P::ScalarField,
+    ) -> Vec<P::ScalarField> {
+        let pts = evaluation_points(num_parties)
+            .into_iter()
+            .map(|x| x[k])
+            .collect_vec();
+        // sum_i alpha^i pows(pts[i])
+        let mut res = pows(pts[num_parties - 1]).take(degree + 1).collect_vec();
+
+        // sum_i alpha^i pows(pts[i])
+        for i in (0..num_parties - 1).rev() {
+            res.par_iter_mut().for_each(|x| *x = alpha * *x);
+            for (x, p) in res.iter_mut().zip(pows(pts[i])) {
+                *x = p + *x
+            }
+        }
+        res
+    }
+
+    pub fn create<R: RngCore, S: CryptographicSponge>(
+        ipa_params: &IPAParams<P>,
+        polynomial: &DensePolynomial<P::ScalarField>,
+        polynomial_blinder: P::ScalarField,
+        k: usize,
+        alpha: P::ScalarField,
+        encryption_randomness: &[[P::ScalarField; 2]; LIMBS],
+        encryption_params: &EncryptionParams<Affine<P>>,
+        public_keys: &Vec<Affine<P>>,
+        combined_public_key: Affine<P>,
+        sponge: &mut S,
+        rng: &mut R,
+    ) -> Self {
+        let b = P::ScalarField::from_bigint((1u64 << LIMB_SIZE).into()).unwrap();
+        let num_parties = public_keys.len();
+
+        // r = sum_ij b^j r_jk
+        let r = pows(b)
+            .zip(encryption_randomness.iter().map(|r| r[k]))
+            .map(|(b_j, r_jk)| b_j * r_jk)
+            .sum();
+
+        let public = Self::combined_powers(num_parties, k, polynomial.coeffs.len() - 1, alpha);
+
+        let mut sponge_clone = sponge.clone();
+        let ipa = ipa_params.prove(sponge, rng, polynomial.coeffs.clone(), public);
+
+        let schnorr_bases = Self::schnorr_bases(
+            ipa.h0,
+            ipa.public0,
+            ipa_params.inner_product_base,
+            combined_public_key,
+            ipa_params.blinder_base,
+        );
+
+        println!("P eval schnorr_bases {schnorr_bases:?}");
+
+        let schnorr_s = [ipa.a0, r, polynomial_blinder + ipa.blinder];
+        // exists r.
+        // c_0 + lr_sum
+        // = (a * (h0 + public0 * inner_product_base)) +
+        let schnorr = Schnorr::<3, P>::prove(&schnorr_bases, &schnorr_s, sponge, rng);
+
+        EvaluationIPA {
+            lr: ipa.lr,
+            schnorr,
         }
     }
 
+    pub fn verify<S: CryptographicSponge>(
+        &self,
+        ipa_params: &IPAParams<P>,
+        polynomial: Affine<P>,
+        k: usize,
+        threshold: usize,
+        alpha: P::ScalarField,
+        encrypted_shares: &EncryptedShares<P>,
+        encryption_params: &EncryptionParams<Affine<P>>,
+        public_keys: &[Affine<P>],
+        combined_public_key: Affine<P>,
+        sponge: &mut S,
+        // chals: &BitpackingIPAChallenges<P>,
+        // c_0: Projective<P>,
+    ) -> bool {
+        let Self { lr, schnorr } = &self;
+
+        let b = P::ScalarField::from_bigint((1u64 << LIMB_SIZE).into()).unwrap();
+        let num_parties = public_keys.len();
+
+        // combined_commitment = sum_ij alpha^i b^j C_ijk
+        let combined_commitment = {
+            let mut bases = vec![];
+            let mut scalars = vec![];
+
+            let mut alpha_i = P::ScalarField::one();
+            for i in 0..num_parties {
+                let mut alpha_i_b_j = alpha_i;
+                for j in 0..LIMBS {
+                    bases.push(encrypted_shares.per_party[i][j][k]);
+                    scalars.push(alpha_i_b_j);
+
+                    alpha_i_b_j *= b;
+                }
+                alpha_i *= alpha;
+            }
+
+            <Projective<P> as VariableBaseMSM>::msm(&bases, &scalars).unwrap()
+        };
+        if k == 0 && public_keys.len() == 1 {
+            let comm = combined_commitment.into_affine();
+            println!("V comm {comm:?}");
+        }
+
+        let IPAVerifierOutput {
+            h0,
+            public0,
+            lr_sum,
+        } = verify_ipa(
+            &ipa_params.h,
+            sponge,
+            Self::combined_powers(num_parties, k, threshold - 1, alpha),
+            lr,
+        );
+
+        // Check lr_sum + c_0 == ()
+        // Need to verify knowledge of a, s, t  such that
+        //
+        // C_0 + lr_sum
+        // = (a * (h0 + public0 * inner_product_base)) + t (Y + \delta G) + s * blinder_base
+
+        let schnorr_bases = Self::schnorr_bases(
+            h0.into_affine(),
+            public0,
+            ipa_params.inner_product_base,
+            combined_public_key,
+            ipa_params.blinder_base,
+        );
+
+        println!("V eval schnorr_bases {schnorr_bases:?}");
+
+        schnorr.verify(
+            combined_commitment + polynomial + lr_sum,
+            &schnorr_bases,
+            sponge,
+        )
+    }
+}
+
+impl<P: GLVConfig> BitpackingIPA<P> {
     fn schnorr_bases(
         h0: Affine<P>,
         public0: P::ScalarField,
         inner_product_base: Affine<P>,
         delta: P::ScalarField,
-        y: Affine<P>,
+        combined_public_key: Affine<P>,
         public_key_base: Affine<P>,
         blinder_base: Affine<P>,
     ) -> [Affine<P>; 3] {
         [
             (h0 + inner_product_base * public0).into_affine(),
-            (y + (public_key_base * delta)).into_affine(),
+            (combined_public_key + (public_key_base * delta)).into_affine(),
             blinder_base,
         ]
     }
 
-    pub fn prove<R: RngCore, S: CryptographicSponge>(
-        &self,
-        shares: &ShareLimbs,
+    fn create<R: RngCore, S: CryptographicSponge>(
+        ipa_params: &IPAParams<P>,
         encryption_randomness: &[[P::ScalarField; 2]; LIMBS],
-        encrypted_shares: &EncryptedShares<P>,
         encryption_params: &EncryptionParams<Affine<P>>,
-        public_keys: &Vec<Affine<P>>,
+        num_parties: usize,
+        combined_public_key: Affine<P>,
+        chals: &Challenges<P>,
+        bits: &BitsWithCommitment<P>,
         sponge: &mut S,
         rng: &mut R,
-    ) -> (BitpackingIPAChallenges<P>, BitpackingIPA<P>) {
-        let mut bits: Vec<P::ScalarField> = vec![];
-        let bit_commitment_blinder = P::ScalarField::rand(rng);
+        /*
+                shares: &ShareLimbs,
+                encrypted_shares: &EncryptedShares<P>,
+        */
+    ) -> BitpackingIPA<P> {
         // TODO: Use a batch affine version if efficiency is needed.
-        let mut bit_commitment = self.ipa.blinder_base * bit_commitment_blinder;
-        let mut idx = 0;
-        for i in 0..self.num_parties {
-            for j in 0..LIMBS {
-                for k in 0..2 {
-                    for l in 0..LIMB_SIZE {
-                        let b = (shares.per_party[i][j][k] >> l) & 1;
-                        if b == 1 {
-                            bit_commitment += self.ipa.h[idx];
-                        }
-                        bits.push(P::ScalarField::from_bigint(b.into()).unwrap());
-                        idx += 1;
-                    }
-                }
-            }
-        }
-        let bit_commitment = bit_commitment.into_affine();
-        absorb_curve(sponge, &bit_commitment);
-        let chals = encrypted_shares.challenges(sponge);
+        // let chals = encrypted_shares.challenges(sponge);
 
         // sum_jk beta^j gamma^k r_jk
         let r = {
@@ -606,65 +911,64 @@ impl<P: GLVConfig> BitPackingIPAParams<P> {
             r
         };
 
-        let ipa = self.ipa.prove(
+        let ipa = ipa_params.prove(
             sponge,
             rng,
-            bits,
-            chals.bit_packing_coefficients(self.num_parties),
+            // Don't really need to clone this
+            bits.bits.clone(),
+            chals.bit_packing_coefficients(num_parties),
         );
 
-        println!("P alpha {:?}", chals.alpha);
-        println!("P h0 {:?}", ipa.h0);
-        println!("P public0 {:?}", ipa.public0);
-        let schnorr_bases = BitPackingIPAParams::schnorr_bases(
+        let schnorr_bases = Self::schnorr_bases(
             ipa.h0,
             ipa.public0,
-            self.ipa.inner_product_base,
+            ipa_params.inner_product_base,
             chals.delta,
-            chals.combined_public_key(public_keys).into_affine(),
+            combined_public_key,
             encryption_params.public_key_base,
-            self.ipa.blinder_base,
+            ipa_params.blinder_base,
         );
-        println!("P schnorr bases {schnorr_bases:?}");
+
         let schnorr = Schnorr::prove(
             &schnorr_bases,
-            &[ipa.a0, r, bit_commitment_blinder + ipa.blinder],
+            &[ipa.a0, r, bits.blinder + ipa.blinder],
             sponge,
             rng,
         );
 
-        (
-            chals,
-            BitpackingIPA {
-                bit_commitment,
-                lr: ipa.lr,
-                schnorr,
-            },
-        )
+        BitpackingIPA {
+            bit_commitment: bits.comm,
+            lr: ipa.lr,
+            schnorr,
+        }
     }
 
-    pub fn verify<S: CryptographicSponge>(
+    fn verify<S: CryptographicSponge>(
         &self,
+        ipa_params: &IPAParams<P>,
         encryption_params: &EncryptionParams<Affine<P>>,
         sponge: &mut S,
         encrypted_shares: &EncryptedShares<P>,
-        public_keys: &Vec<Affine<P>>,
-        // chals: &BitpackingIPAChallenges<P>,
+        num_parties: usize,
+        combined_public_key: Affine<P>,
+        chals: &Challenges<P>,
         // c_0: Projective<P>,
-        proof: &BitpackingIPA<P>,
     ) -> bool {
-        absorb_curve(sponge, &proof.bit_commitment);
+        let Self {
+            bit_commitment,
+            lr,
+            schnorr,
+        } = &self;
 
-        let chals = encrypted_shares.challenges(sponge);
-        let c_0 = encrypted_shares.combined_commitment(&chals) + proof.bit_commitment;
+        let c_0 = encrypted_shares.combined_commitment(&chals) + bit_commitment;
 
-        let public = chals.bit_packing_coefficients(self.num_parties);
+        let public = chals.bit_packing_coefficients(num_parties);
 
         let IPAVerifierOutput {
             h0,
             public0,
             lr_sum,
-        } = verify_ipa(&self.ipa.h, sponge, public, &proof.lr);
+        } = verify_ipa(&ipa_params.h, sponge, public, lr);
 
         // Check lr_sum + c_0 == ()
         // Need to verify knowledge of a, s, t  such that
@@ -672,23 +976,32 @@ impl<P: GLVConfig> BitPackingIPAParams<P> {
         // C_0 + lr_sum
         // = (a * (h0 + public0 * inner_product_base)) + t (Y + \delta G) + s * blinder_base
 
-        println!("V alpha {:?}", chals.alpha);
-        println!("V h0 {:?}", h0.into_affine());
-        println!("V public0 {:?}", public0);
-
-        let schnorr_bases = BitPackingIPAParams::schnorr_bases(
+        let schnorr_bases = Self::schnorr_bases(
             h0.into_affine(),
             public0,
-            self.ipa.inner_product_base,
+            ipa_params.inner_product_base,
             chals.delta,
-            chals.combined_public_key(public_keys).into_affine(),
+            combined_public_key,
             encryption_params.public_key_base,
-            self.ipa.blinder_base,
+            ipa_params.blinder_base,
         );
-        println!("V schnorr bases {schnorr_bases:?}");
-        proof.schnorr.verify(c_0 + lr_sum, &schnorr_bases, sponge)
+
+        schnorr.verify(c_0 + lr_sum, &schnorr_bases, sponge)
     }
 }
+
+/*
+impl<P: GLVConfig> BitPackingIPAParams<P> {
+    pub fn new(num_parties: usize) -> Self {
+        let prefix = b"bit_packing_ipa_param";
+        let num_bits = 1 << log2(num_parties * SECRETS * LIMBS * LIMB_SIZE);
+        BitPackingIPAParams {
+            ipa: IPAParams::new(prefix, num_bits),
+            num_parties,
+        }
+
+}
+    } */
 
 fn absorb_curve<P: SWCurveConfig, S: CryptographicSponge>(sponge: &mut S, g: &Affine<P>) {
     let (x, y) = g.xy().unwrap();
@@ -719,21 +1032,21 @@ struct IPAVerifierOutput<P: SWCurveConfig> {
 }
 
 pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
-    h: &Vec<Affine<P>>,
+    h: &[Affine<P>],
     sponge: &mut S,
     mut public: Vec<P::ScalarField>,
-    lr: &Vec<(Affine<P>, Affine<P>)>,
+    lr: &[(Affine<P>, Affine<P>)],
 ) -> IPAVerifierOutput<P> {
     let mut bases = vec![];
     let mut scalars = vec![];
     let mut chals = vec![];
-    let mut idx = 0;
 
     let ceil_pow2 = 1 << log2(public.len());
     assert!(h.len() >= ceil_pow2);
     let padding = (1 << log2(public.len())) as usize - public.len();
     public.extend((0..padding).map(|_| P::ScalarField::zero()));
 
+    let mut idx = 0;
     for (l, r) in lr.iter() {
         let m = public.len() / 2;
 
@@ -746,9 +1059,11 @@ pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
 
         chals.push(x_inv);
 
-        println!("V m {m}");
-        println!("V public0 {idx} = {:?}", public[0]);
-        println!("V publicm {idx} = {:?}", public[m]);
+        /*
+                println!("V m {m}");
+                println!("V public0 {idx} = {:?}", public[0]);
+                println!("V publicm {idx} = {:?}", public[m]);
+        */
         for i in 0..m {
             public[i] = public[i] + x_inv * public[m + i];
         }
@@ -763,9 +1078,10 @@ pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
 
     let public0 = public[0];
 
+    let ck_scalars = commitment_key_scalars(&chals);
     IPAVerifierOutput {
         lr_sum: <Projective<P> as VariableBaseMSM>::msm(&bases, &scalars).unwrap(),
-        h0: VariableBaseMSM::msm_unchecked(h, &commitment_key_scalars(&chals)),
+        h0: VariableBaseMSM::msm(&h[..ck_scalars.len()], &ck_scalars).unwrap(),
         public0,
     }
 }
@@ -778,19 +1094,24 @@ impl<P: GLVConfig> IPAParams<P> {
         mut a: Vec<P::ScalarField>,
         mut public: Vec<P::ScalarField>,
     ) -> IPAProverOutput<P> {
+        let mut sponge_clone = sponge.clone();
+
         let mut blinder = P::ScalarField::zero();
         let mut lr = vec![];
 
         // pad
         assert_eq!(a.len(), public.len());
         let ceil_pow2 = 1 << log2(a.len());
+        // println!("{} {} {}", a.len(), ceil_pow2, self.h.len());
         assert!(self.h.len() >= ceil_pow2);
         let mut h = self.h[..ceil_pow2].to_vec();
+        // println!("P h len {}", h.len());
         let padding = (1 << log2(a.len())) as usize - a.len();
         a.extend((0..padding).map(|_| P::ScalarField::zero()));
         public.extend((0..padding).map(|_| P::ScalarField::zero()));
 
         let mut idx = 0;
+        let mut x_invs = vec![];
         while a.len() > 1 {
             let m = a.len() / 2;
             let l_blinder = P::ScalarField::rand(rng);
@@ -815,11 +1136,15 @@ impl<P: GLVConfig> IPAParams<P> {
             let x_inv = endoscalar_to_field::<P>(&x_inv_bits[..]);
             let x = x_inv.inverse().unwrap();
 
+            x_invs.push(x_inv);
+
             blinder += x * l_blinder + x_inv * r_blinder;
 
-            println!("P m {m}");
-            println!("P public0 {idx} = {:?}", public[0]);
-            println!("P publicm {idx} = {:?}", public[m]);
+            /*
+                        println!("P m {m}");
+                        println!("P public0 {idx} = {:?}", public[0]);
+                        println!("P publicm {idx} = {:?}", public[m]);
+            */
             for i in 0..m {
                 a[i] = a[i] + x * a[m + i];
                 public[i] = public[i] + x_inv * public[m + i];
@@ -840,93 +1165,4 @@ impl<P: GLVConfig> IPAParams<P> {
             blinder,
         }
     }
-}
-
-pub fn prove_ipa<P: GLVConfig, R: RngCore, S: CryptographicSponge>(
-    blinder_base: Affine<P>,
-    inner_product_base: Affine<P>,
-    mut h: Vec<Affine<P>>,
-    rng: &mut R,
-    sponge: &mut S,
-    mut a: Vec<P::ScalarField>,
-    mut public: Vec<P::ScalarField>,
-    // The main commitment
-    /*
-        c_0: Affine<P>,
-        y_minus_delta_g: Affine<P>,
-        y_minus_delta_g_coeff: P::ScalarField,
-    */
-) -> IPAProverOutput<P> {
-    let mut blinder = P::ScalarField::zero();
-    let mut lr = vec![];
-
-    // pad
-    assert_eq!(a.len(), public.len());
-    let padding = (1 << log2(a.len())) as usize - a.len();
-    a.extend((0..padding).map(|_| P::ScalarField::zero()));
-    public.extend((0..padding).map(|_| P::ScalarField::zero()));
-
-    while a.len() > 1 {
-        let m = a.len() / 2;
-        let l_blinder = P::ScalarField::rand(rng);
-        let r_blinder = P::ScalarField::rand(rng);
-        let z_l = inner_product(&a[m..], &public[..m]);
-        let z_r = inner_product(&a[..m], &public[m..]);
-
-        let l = <Projective<P> as VariableBaseMSM>::msm(&h[..m], &a[m..]).unwrap()
-            + blinder_base * l_blinder
-            + inner_product_base * z_l;
-        let r = <Projective<P> as VariableBaseMSM>::msm(&h[m..], &a[..m]).unwrap()
-            + blinder_base * r_blinder
-            + inner_product_base * z_r;
-        let l = l.into_affine();
-        let r = r.into_affine();
-        absorb_curve(sponge, &l);
-        absorb_curve(sponge, &r);
-        // make 0 knowledge
-        lr.push((l, r));
-
-        let x_inv_bits = sponge.squeeze_bits(128);
-        let x_inv = endoscalar_to_field::<P>(&x_inv_bits[..]);
-        let x = x_inv.inverse().unwrap();
-
-        blinder += x * l_blinder + x_inv * r_blinder;
-
-        for i in 0..m {
-            a[i] = a[i] + x * a[m + i];
-            public[i] = public[i] + x_inv * public[m + i];
-        }
-        a.truncate(m);
-        public.truncate(m);
-
-        h = affine_window_combine_one_endo(P::ENDO_COEFFS[0], &h[..m], &h[m..], &x_inv_bits);
-    }
-
-    return IPAProverOutput {
-        h0: h[0],
-        a0: a[0],
-        public0: public[0],
-        lr,
-        blinder,
-    };
-
-    // Let C_0 be our original commitment.
-    // Let C = a[0] * (h[0] + public[0] inner_product_base)
-    // At the end, we want to prove knowledge of a, s, t  such that
-    //
-    // C_0 + \sum x_i l_i + x_inv_i r_i
-    // = (a * (h[0] + public[0] * inner_product_base)) + t (Y - \delta G) + s * blinder_base
-    let r_a = P::ScalarField::rand(rng);
-    /*
-    let r_s = P::ScalarField::rand(rng);
-    let r_t = P::ScalarField::rand(rng);
-
-        let c = <Projective<P> as VariableBaseMSM>::msm(
-            &[h[0], inner_product_base, blinder_base, y_minus_delta_g],
-            &[a[0], a[0] * public[0], blinder, y_minus_delta_g_coeff],
-        )
-        .unwrap()
-        .into_affine();
-    */
-    // TODO:schnorr
 }
