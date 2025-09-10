@@ -176,10 +176,16 @@ struct EvaluationIPA<P: SWCurveConfig> {
     schnorr: Schnorr<3, P>,
 }
 
+struct SimpleEvaluationIPA<P: SWCurveConfig> {
+    lr: Vec<(Affine<P>, Affine<P>)>,
+    schnorr: Schnorr<2, P>,
+}
+
 struct Proof<P: SWCurveConfig> {
     bit_packing: BitpackingIPA<P>,
     polynomials: [Affine<P>; SECRETS],
     evaluation: [EvaluationIPA<P>; SECRETS],
+    secrets_agree: SimpleEvaluationIPA<P>,
 }
 
 pub struct EncryptedSharesWithProof<P: SWCurveConfig> {
@@ -219,6 +225,12 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
     ) -> bool {
         let num_parties = public_keys.len();
         let mut sponge = ShakeSponge::new(&());
+        let Proof {
+            bit_packing,
+            polynomials,
+            evaluation,
+            secrets_agree,
+        } = &self.proof;
 
         let sponge = &mut sponge;
         self.shares
@@ -239,7 +251,7 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
 
         let combined_public_key = chals.combined_public_key(public_keys).into_affine();
 
-        if !self.proof.bit_packing.verify(
+        if !bit_packing.verify(
             ipa_params,
             encryption_params,
             sponge,
@@ -251,11 +263,11 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
             return false;
         }
 
-        for (k, e) in self.proof.evaluation.iter().enumerate() {
+        for (k, e) in evaluation.iter().enumerate() {
             println!("V poly eval {k}");
             if !e.verify(
                 ipa_params,
-                self.proof.polynomials[k],
+                polynomials[k],
                 k,
                 threshold,
                 chals.alpha,
@@ -269,8 +281,18 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
             }
         }
 
+        if !secrets_agree.verify(
+            ipa_params,
+            (polynomials[0] - polynomials[1]).into_affine(),
+            threshold,
+            P::ScalarField::zero(),
+            P::ScalarField::zero(),
+            sponge,
+        ) {
+            return false;
+        }
+
         true
-        // TODO: Absorb the polynomial commitments
     }
 }
 
@@ -570,12 +592,23 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
         )
     });
 
+    // Prove the difference of the 2 polynomials evaluates to 0 at 0.
+    let secrets_agree = SimpleEvaluationIPA::create(
+        ipa_params,
+        &(&polynomials.0[0] - &polynomials.0[1]),
+        poly_comms[0].1 - poly_comms[1].1,
+        P::ScalarField::zero(),
+        sponge,
+        rng,
+    );
+
     EncryptedSharesWithProof {
         shares: encrypted_shares,
         proof: Proof {
             bit_packing: bitpacking_ipa,
             polynomials: map(&poly_comms, |(g, _)| g),
             evaluation,
+            secrets_agree,
         },
     }
 }
@@ -692,6 +725,90 @@ impl<P: SWCurveConfig + GLVConfig> IPAParams<P> {
             blinder_base,
             inner_product_base,
         }
+    }
+}
+
+impl<P: GLVConfig> SimpleEvaluationIPA<P> {
+    fn schnorr_bases(
+        h0: Affine<P>,
+        public0: P::ScalarField,
+        inner_product_base: Affine<P>,
+        blinder_base: Affine<P>,
+    ) -> [Affine<P>; 2] {
+        [
+            (h0 + inner_product_base * public0).into_affine(),
+            blinder_base,
+        ]
+    }
+
+    pub fn create<R: RngCore, S: CryptographicSponge>(
+        ipa_params: &IPAParams<P>,
+        polynomial: &DensePolynomial<P::ScalarField>,
+        polynomial_blinder: P::ScalarField,
+        evaluation_point: P::ScalarField,
+        sponge: &mut S,
+        rng: &mut R,
+    ) -> Self {
+        let public = pows(evaluation_point)
+            .take(polynomial.degree() + 1)
+            .collect_vec();
+
+        let ipa = ipa_params.prove(sponge, rng, polynomial.coeffs.clone(), public);
+
+        let schnorr_bases = Self::schnorr_bases(
+            ipa.h0,
+            ipa.public0,
+            ipa_params.inner_product_base,
+            ipa_params.blinder_base,
+        );
+
+        let schnorr_s = [ipa.a0, polynomial_blinder + ipa.blinder];
+        let schnorr = Schnorr::<2, P>::prove(&schnorr_bases, &schnorr_s, sponge, rng);
+
+        SimpleEvaluationIPA {
+            lr: ipa.lr,
+            schnorr,
+        }
+    }
+
+    pub fn verify<S: CryptographicSponge>(
+        &self,
+        ipa_params: &IPAParams<P>,
+        polynomial: Affine<P>,
+        degree: usize,
+        evaluation_point: P::ScalarField,
+        evaluation: P::ScalarField,
+        sponge: &mut S,
+        // chals: &BitpackingIPAChallenges<P>,
+        // c_0: Projective<P>,
+    ) -> bool {
+        let Self { lr, schnorr } = &self;
+
+        let combined_commitment = ipa_params.inner_product_base * evaluation;
+
+        let IPAVerifierOutput {
+            h0,
+            public0,
+            lr_sum,
+        } = verify_ipa(
+            &ipa_params.h,
+            sponge,
+            pows(evaluation_point).take(degree + 1).collect_vec(),
+            lr,
+        );
+
+        let schnorr_bases = Self::schnorr_bases(
+            h0.into_affine(),
+            public0,
+            ipa_params.inner_product_base,
+            ipa_params.blinder_base,
+        );
+
+        schnorr.verify(
+            combined_commitment + polynomial + lr_sum,
+            &schnorr_bases,
+            sponge,
+        )
     }
 }
 
