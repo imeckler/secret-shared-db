@@ -41,9 +41,12 @@ use ark_ec::{
     short_weierstrass::{Affine, Projective, SWCurveConfig},
 };
 use ark_ff::{AdditiveGroup, BigInteger, Field, One, PrimeField, UniformRand, Zero};
-use ark_poly::{DenseUVPolynomial, Polynomial, univariate::DensePolynomial};
+use ark_poly::{
+    DenseUVPolynomial, EvaluationDomain, Evaluations, Polynomial, Radix2EvaluationDomain,
+    univariate::DensePolynomial,
+};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{log2, rand::RngCore};
+use ark_std::{iterable::Iterable, log2, rand::RngCore};
 use array_init::array_init;
 use itertools::{Itertools, assert_equal};
 use rand::random;
@@ -56,7 +59,7 @@ use tiny_keccak::{Hasher, Shake};
 
 use crate::{
     combine::{
-        affine_window_combine_one_endo, batch_add_assign_no_branch, batch_glv_mul,
+        self, affine_window_combine_one_endo, batch_add_assign_no_branch, batch_glv_mul,
         batch_negate_in_place,
     },
     dlog_table::DLogTable,
@@ -65,8 +68,8 @@ use crate::{
 };
 
 const LIMBS: usize = 16;
-const LIMB_SIZE: usize = 256 / 16;
-const BYTES_PER_LIMB: usize = LIMB_SIZE / 8;
+const NON_FINAL_LIMB_SIZE: usize = 256 / 16;
+const BYTES_PER_LIMB: usize = NON_FINAL_LIMB_SIZE / 8;
 const SECRETS: usize = 2;
 
 pub struct SharePolynomials<F: Field>([DensePolynomial<F>; SECRETS]);
@@ -181,8 +184,17 @@ struct SimpleEvaluationIPA<P: SWCurveConfig> {
     schnorr: Schnorr<2, P>,
 }
 
+struct BooleanityProof<P: SWCurveConfig> {
+    lr: Vec<(Affine<P>, Affine<P>)>,
+    quotient: Affine<P>,
+    bit_commitment_eval: P::ScalarField,
+    quotient_eval: P::ScalarField,
+    schnorr: Schnorr<2, P>,
+}
+
 struct Proof<P: SWCurveConfig> {
     bit_packing: BitpackingIPA<P>,
+    booleanity: BooleanityProof<P>,
     polynomials: [Affine<P>; SECRETS],
     evaluation: [EvaluationIPA<P>; SECRETS],
     secrets_agree: SimpleEvaluationIPA<P>,
@@ -194,17 +206,17 @@ pub struct EncryptedSharesWithProof<P: SWCurveConfig> {
 }
 
 impl<P: GLVConfig> EncryptedSharesWithProof<P> {
-    pub fn decrypt_and_verify(
+    pub fn decrypt_and_verify<'a>(
         &self,
         encryption_params: &EncryptionParams<Affine<P>>,
-        ipa_params: &IPAParams<P>,
+        plonk_params: &PLONKIPAParams<'a, P>,
         table: &DLogTable<P>,
         secret_key: P::ScalarField,
         i: usize,
         public_keys: &Vec<Affine<P>>,
         threshold: usize,
     ) -> Option<[P::ScalarField; 2]> {
-        if self.verify(encryption_params, ipa_params, public_keys, threshold) {
+        if self.verify(encryption_params, plonk_params, public_keys, threshold) {
             let shares: SinglePartyEncryptedShares<Affine<P>> = SinglePartyEncryptedShares {
                 by_limb: &self.shares.per_party[i],
                 randomness: &self.shares.randomness,
@@ -216,16 +228,18 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
         }
     }
 
-    pub fn verify(
+    pub fn verify<'a>(
         &self,
         encryption_params: &EncryptionParams<Affine<P>>,
-        ipa_params: &IPAParams<P>,
+        plonk_params: &PLONKIPAParams<'a, P>,
         public_keys: &Vec<Affine<P>>,
         threshold: usize,
     ) -> bool {
         let num_parties = public_keys.len();
+        let ipa_params = plonk_params.ipa;
         let mut sponge = ShakeSponge::new(&());
         let Proof {
+            booleanity,
             bit_packing,
             polynomials,
             evaluation,
@@ -236,15 +250,15 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
         self.shares
             .randomness
             .iter()
-            .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, r)));
+            .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, &r)));
         self.shares.per_party.iter().for_each(|p| {
             p.iter()
-                .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, s)))
+                .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, &s)))
         });
         self.proof
             .polynomials
             .iter()
-            .for_each(|g| absorb_curve(sponge, g));
+            .for_each(|g| absorb_curve(sponge, &g));
         absorb_curve(sponge, &self.proof.bit_packing.bit_commitment);
 
         let chals = Challenges::create(sponge);
@@ -264,7 +278,6 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
         }
 
         for (k, e) in evaluation.iter().enumerate() {
-            println!("V poly eval {k}");
             if !e.verify(
                 ipa_params,
                 polynomials[k],
@@ -292,6 +305,14 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
             return false;
         }
 
+        if !booleanity.verify(
+            &plonk_params.domain,
+            &bit_packing.bit_commitment,
+            plonk_params,
+            sponge,
+        ) {
+            return false;
+        }
         true
     }
 }
@@ -306,6 +327,15 @@ fn map2<A: Copy, B: Copy, C, F: Fn(A, B) -> C, const N: usize>(
     f: F,
 ) -> [C; N] {
     array_init(|i| f(xs[i], ys[i]))
+}
+
+fn limb_size<F: PrimeField>(i: usize) -> usize {
+    let final_limb_size = F::MODULUS_BIT_SIZE as usize % NON_FINAL_LIMB_SIZE;
+    if i < LIMBS - 1 {
+        NON_FINAL_LIMB_SIZE
+    } else {
+        final_limb_size
+    }
 }
 
 struct Challenges<P: SWCurveConfig> {
@@ -334,6 +364,15 @@ impl<P: SWCurveConfig> Challenges<P> {
         }
     }
 
+    // Coefficients are
+    // for i in 0..num_parties
+    // for j in 0..LIMBS
+    // for k in 0..SECRETS
+    // for l in 0..(num bits of limb L (the final limb is short))
+    // alpha^i beta^j gamma^k 2^l
+    //
+    // followed by
+    // 0 (to allow for any coefficient in subsequent positions)
     fn bit_packing_coefficients(&self, num_parties: usize) -> Vec<P::ScalarField> {
         let Self {
             alpha,
@@ -346,12 +385,12 @@ impl<P: SWCurveConfig> Challenges<P> {
         let mut alpha_i = P::ScalarField::one();
         for _i in 0..num_parties {
             let mut alpha_i_beta_j = alpha_i;
-            for _j in 0..LIMBS {
+            for j in 0..LIMBS {
                 let mut alpha_i_beta_j_gamma_k = alpha_i_beta_j;
                 for _k in 0..2 {
                     // 2^l * alpha^i * beta^j * gamma^k
                     let mut c = alpha_i_beta_j_gamma_k;
-                    for _l in 0..LIMB_SIZE {
+                    for _l in 0..limb_size::<P::ScalarField>(j) {
                         public.push(c);
                         c.double_in_place();
                     }
@@ -361,6 +400,12 @@ impl<P: SWCurveConfig> Challenges<P> {
             }
             alpha_i *= alpha;
         }
+        let padding = (1 << log2(public.len())) - public.len();
+        // Need some empty slots to allow us to randomize for the PLONK-type argument
+        assert!(padding > 0);
+        // allow any value in the committed vector at the remaining positions
+        public.extend((0..padding).map(|_| P::ScalarField::zero()));
+        assert_eq!(public.len(), 1 << log2(public.len()));
 
         // pad
         /*
@@ -372,7 +417,7 @@ impl<P: SWCurveConfig> Challenges<P> {
 }
 
 struct BitsWithCommitment<P: SWCurveConfig> {
-    bits: Vec<P::ScalarField>,
+    coeffs: Vec<P::ScalarField>,
     comm: Affine<P>,
     blinder: P::ScalarField,
 }
@@ -384,7 +429,7 @@ impl ShareLimbs {
         rng: &mut R,
     ) -> BitsWithCommitment<P> {
         let num_parties = self.per_party.len();
-        let mut bits: Vec<P::ScalarField> = vec![];
+        let mut coeffs: Vec<P::ScalarField> = vec![];
         let bit_commitment_blinder = P::ScalarField::rand(rng);
         // TODO: Use a batch affine version if efficiency is needed.
         let mut bit_commitment = ipa_params.blinder_base * bit_commitment_blinder;
@@ -392,20 +437,23 @@ impl ShareLimbs {
         for i in 0..num_parties {
             for j in 0..LIMBS {
                 for k in 0..2 {
-                    for l in 0..LIMB_SIZE {
+                    for l in 0..limb_size::<P::ScalarField>(j) {
                         let b = (self.per_party[i][j][k] >> l) & 1;
                         if b == 1 {
                             bit_commitment += ipa_params.h[idx];
                         }
-                        bits.push(P::ScalarField::from_bigint(b.into()).unwrap());
+                        coeffs.push(P::ScalarField::from_bigint(b.into()).unwrap());
                         idx += 1;
                     }
                 }
             }
         }
+        let final_random_value = P::ScalarField::rand(rng);
+        coeffs.push(final_random_value);
+        bit_commitment += ipa_params.h[idx] * final_random_value;
         let bit_commitment = bit_commitment.into_affine();
         BitsWithCommitment {
-            bits,
+            coeffs,
             comm: bit_commitment,
             blinder: bit_commitment_blinder,
         }
@@ -467,10 +515,10 @@ pub fn decrypt<P: SWCurveConfig + GLVConfig>(
         .iter()
         .zip(shares.randomness.iter())
         .map(|(cs, rs)| {
-            let mut yrs = batch_glv_mul(rs, secret_key);
+            let mut yrs = batch_glv_mul(&rs, secret_key);
             batch_negate_in_place(&mut yrs);
             let mut denoms = vec![P::BaseField::zero(); num_secrets];
-            batch_add_assign_no_branch(&mut denoms, &mut yrs, cs);
+            batch_add_assign_no_branch(&mut denoms, &mut yrs, &cs);
             let res = yrs;
             res.par_iter()
                 .map(|g| table.bruteforce_dlog(g).unwrap())
@@ -490,9 +538,9 @@ pub fn decrypt<P: SWCurveConfig + GLVConfig>(
     })
 }
 
-pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
+pub fn encrypt<'a, R: RngCore, P: GLVConfig + SWCurveConfig>(
     params: &EncryptionParams<Affine<P>>,
-    ipa_params: &IPAParams<P>,
+    plonk_params: &PLONKIPAParams<'a, P>,
     // The table is a table of powers of ipa_params.inner_product_base
     table: &DLogTable<P>,
     polynomials: &SharePolynomials<P::ScalarField>,
@@ -522,7 +570,7 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
         .zip(public_keys.iter())
         .map(|(by_limb, pk)| {
             let pk_table = BatchMulPreprocessing::new(pk.into_group(), num_secrets);
-            map2(by_limb, &rs, |v, r| {
+            map2(&by_limb, &rs, |v, r| {
                 let res = v.map(|m| table.from_u16(m));
                 let pkr = pk_table.batch_mul(&r);
                 array_init::array_init(|i| (res[i] + pkr[i]).into_affine())
@@ -535,6 +583,8 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
         per_party: shares,
     };
 
+    let ipa_params = plonk_params.ipa;
+
     let poly_comms = polynomials.commitments(rng, ipa_params);
 
     let bits = limbs.bits_with_commitment(ipa_params, rng);
@@ -544,14 +594,14 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
     encrypted_shares
         .randomness
         .iter()
-        .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, r)));
+        .for_each(|rs| rs.iter().for_each(|r| absorb_curve(sponge, &r)));
     encrypted_shares.per_party.iter().for_each(|p| {
         p.iter()
-            .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, s)))
+            .for_each(|ss| ss.iter().for_each(|s| absorb_curve(sponge, &s)))
     });
     poly_comms
         .iter()
-        .for_each(|(g, _r)| absorb_curve(sponge, g));
+        .for_each(|(g, _r)| absorb_curve(sponge, &g));
     absorb_curve(sponge, &bits.comm);
 
     let chals = Challenges::create(sponge);
@@ -571,12 +621,6 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
     );
 
     let evaluation = array_init(|k| {
-        println!(
-            "poly {k} deg/len = {}/{}",
-            polynomials.0[k].degree(),
-            polynomials.0[k].coeffs.len()
-        );
-        println!("P poly eval {k}");
         EvaluationIPA::create(
             ipa_params,
             &polynomials.0[k],
@@ -602,9 +646,12 @@ pub fn encrypt<R: RngCore, P: GLVConfig + SWCurveConfig>(
         rng,
     );
 
+    let booleanity = BooleanityProof::create(plonk_params, &bits, num_parties, sponge, rng);
+
     EncryptedSharesWithProof {
         shares: encrypted_shares,
         proof: Proof {
+            booleanity,
             bit_packing: bitpacking_ipa,
             polynomials: map(&poly_comms, |(g, _)| g),
             evaluation,
@@ -617,6 +664,25 @@ pub struct EncryptionParams<G> {
     pub public_key_base: G,
 }
 
+// Let num_bits = 255 * SECRETS * num_parties
+// Let b_0,...,b_{num_bits - 1} be all the bits
+// Let C_ijk be the cipher texts
+// Let B = 2^16 be the limb base
+// Let Y_i be the public key of party i
+//
+// A proof of:
+// exists A b_0,...., b_{num_bits - 1}
+// exists m_ijk
+// exists r_jk
+// bit_commitment = sum_{i < num_bits} b_i H_i +  msm(A, H_{num_bits..})
+// and
+// forall i j k. C_ijk = m_ijk G + r_jk Y_i
+// and
+// forall i j k. m_ijk = sum_l 2^l b_i
+//
+// The final term of a * H_num_bits in the bit_commitment is used for
+// for blinding purposes in the PLONK-type argument proving booleanity
+// of the committed values.
 pub struct BitpackingIPA<P: SWCurveConfig> {
     bit_commitment: Affine<P>,
     lr: Vec<(Affine<P>, Affine<P>)>,
@@ -628,6 +694,30 @@ pub struct IPAParams<P: SWCurveConfig> {
     blinder_base: Affine<P>,
     // Has to be the same as the encryption base
     pub inner_product_base: Affine<P>,
+}
+
+pub struct PLONKIPAParams<'a, P: SWCurveConfig> {
+    ipa: &'a IPAParams<P>,
+    // monomial_basis: Vec<Affine<P>>,
+    domain: Radix2EvaluationDomain<P::ScalarField>,
+    domain2: Radix2EvaluationDomain<P::ScalarField>,
+}
+
+impl<'a, P: SWCurveConfig> PLONKIPAParams<'a, P> {
+    pub fn new(ipa: &'a IPAParams<P>, column_size: usize) -> Self {
+        let domain = Radix2EvaluationDomain::<P::ScalarField>::new(column_size).unwrap();
+        let domain2 = Radix2EvaluationDomain::<P::ScalarField>::new(2 * domain.size()).unwrap();
+        assert_eq!(domain.group_gen, domain2.group_gen.square());
+
+        // Act as if the ipa.h bases are lagrange polynomials and reinterpet the coefficient
+        // polynomials.
+        Self {
+            ipa,
+            // monomial_basis,
+            domain,
+            domain2,
+        }
+    }
 }
 
 /*
@@ -725,6 +815,212 @@ impl<P: SWCurveConfig + GLVConfig> IPAParams<P> {
             blinder_base,
             inner_product_base,
         }
+    }
+}
+
+impl<P: GLVConfig> BooleanityProof<P> {
+    fn schnorr_bases(
+        h0: Affine<P>,
+        public0: P::ScalarField,
+        inner_product_base: Affine<P>,
+        blinder_base: Affine<P>,
+    ) -> [Affine<P>; 2] {
+        [
+            (h0 + inner_product_base * public0).into_affine(),
+            blinder_base,
+        ]
+    }
+
+    // let S = num_parties * P::ScalarField::MODULUS_BIT_SIZE * SECRETS
+    // Prove that
+    // for all x in the domain (with the exception of omega^S)
+    // bit_commitment(x)^2 - bit_commitment(x) = 0
+    // (i.e., x is 0 or 1)
+    //
+    // We do this by showing that
+    // bit_commitment^2 - bit_commitment
+    // is divisible by v_H(x) / (x - omega^S)
+    // I.e.,
+    // exists q such that
+    // bit_commitment^2 - bit_commitment = q * v_H(x) / (x - omega^S)
+    //
+    // bit_commitment has degree n-1, so LHS has degree 2(n - 1).
+    // deg(v_H / (x - omega^S)) = n-1 so
+    // deg(q) = deg(RHS) - (n - 1) = n-1
+    pub fn create<'a, R: RngCore, S: CryptographicSponge>(
+        plonk_params: &PLONKIPAParams<'a, P>,
+        bits: &BitsWithCommitment<P>,
+        num_parties: usize,
+        sponge: &mut S,
+        rng: &mut R,
+    ) -> Self {
+        let domain = plonk_params.domain;
+        let domain2 = plonk_params.domain2;
+
+        let random_value_position = bits.coeffs.len() - 1;
+        assert_eq!(
+            random_value_position,
+            num_parties * P::ScalarField::MODULUS_BIT_SIZE as usize * SECRETS
+        );
+
+        // evaluations of
+        // sum_i bits.coeffs[i] lagrange_i
+        // over the larger domain
+        //
+        // bits.coeffs has a uniform random field element in the final location so it is safe to
+        // reveal one evaluation of this polynomial.
+        let bits_eval = {
+            // Pad with zeros
+            let bits_poly = {
+                let mut evals = bits.coeffs.clone();
+                evals.extend(
+                    (0..domain.size as usize - evals.len()).map(|_| P::ScalarField::zero()),
+                );
+                Evaluations::from_vec_and_domain(evals, domain).interpolate()
+            };
+
+            bits_poly.evaluate_over_domain(domain2)
+        };
+
+        let mut constraint = bits_eval.clone();
+
+        // constraint = (bits^2 - bits)
+        constraint
+            .evals
+            .par_iter_mut()
+            .zip(bits_eval.evals.par_iter())
+            .for_each(|(x, y)| {
+                x.square_in_place();
+                *x -= *y;
+            });
+        let mut constraint = constraint.interpolate();
+        // Multiply by (x - omega^random_value_position).
+        // (x - A) * sum_{i=0}^d c_i x^i = -A c_0 x^0 + sum_{i=1}^{d+1} (c_{i-1} - A c_i) x^i
+        constraint.coeffs.push(P::ScalarField::zero());
+        let omega_n = domain.element(random_value_position);
+        for i in (1..constraint.coeffs.len()).rev() {
+            constraint.coeffs[i] = constraint.coeffs[i - 1] - omega_n * constraint.coeffs[i]
+        }
+        constraint.coeffs[0] *= -omega_n;
+
+        let (quotient_poly, rem) = constraint.divide_by_vanishing_poly(domain);
+        assert!(rem.is_zero());
+        assert!(quotient_poly.coeffs.len() <= plonk_params.ipa.h.len());
+        let quotient_evals = quotient_poly.evaluate_over_domain(domain);
+
+        let (quotient, quotient_blinder) = {
+            let comm =
+                <Projective<P> as VariableBaseMSM>::msm(&plonk_params.ipa.h, &quotient_evals.evals)
+                    .unwrap();
+            let blinder = P::ScalarField::rand(rng);
+            (
+                (comm + plonk_params.ipa.blinder_base * blinder).into_affine(),
+                blinder,
+            )
+        };
+
+        absorb_curve(sponge, &quotient);
+
+        let chals = sponge.squeeze_field_elements(2);
+        let poly_combiner: P::ScalarField = chals[0];
+        let evaluation_point = chals[1];
+
+        let lgr = domain.evaluate_all_lagrange_coefficients(evaluation_point);
+
+        let quotient_eval = quotient_evals
+            .evals
+            .par_iter()
+            .zip(lgr.par_iter())
+            .map(|(x, y)| *x * y)
+            .sum();
+        let bit_commitment_eval = bits
+            .coeffs
+            .par_iter()
+            .zip(lgr.par_iter())
+            .map(|(x, y)| *x * y)
+            .sum();
+
+        let mut combined_poly = quotient_evals;
+        combined_poly
+            .evals
+            .par_iter_mut()
+            .for_each(|x| *x *= poly_combiner);
+        bits.coeffs
+            .par_iter()
+            .zip(combined_poly.evals.par_iter_mut())
+            .for_each(|(c, x)| *x += c);
+        let combined_poly_blinder = bits.blinder + poly_combiner * quotient_blinder;
+
+        let ipa = plonk_params
+            .ipa
+            .prove(sponge, rng, combined_poly.evals, lgr);
+
+        let schnorr_bases = Self::schnorr_bases(
+            ipa.h0,
+            ipa.public0,
+            plonk_params.ipa.inner_product_base,
+            plonk_params.ipa.blinder_base,
+        );
+
+        let schnorr = Schnorr::prove(
+            &schnorr_bases,
+            &[ipa.a0, ipa.blinder + combined_poly_blinder],
+            sponge,
+            rng,
+        );
+
+        BooleanityProof {
+            bit_commitment_eval,
+            quotient_eval,
+            quotient,
+            lr: ipa.lr,
+            schnorr,
+        }
+    }
+
+    pub fn verify<'a, S: CryptographicSponge>(
+        &self,
+        domain: &Radix2EvaluationDomain<P::ScalarField>,
+        bit_commitment: &Affine<P>,
+        plonk_params: &PLONKIPAParams<'a, P>,
+        sponge: &mut S,
+    ) -> bool {
+        let Self {
+            bit_commitment_eval,
+            quotient_eval,
+            quotient,
+            lr,
+            schnorr,
+        } = &self;
+
+        absorb_curve(sponge, quotient);
+        let chals = sponge.squeeze_field_elements(2);
+        let poly_combiner: P::ScalarField = chals[0];
+        let evaluation_point = chals[1];
+
+        let combined_poly = *quotient * poly_combiner + bit_commitment;
+        let combined_evaluation = *quotient_eval * poly_combiner + bit_commitment_eval;
+        let eval_commitment = plonk_params.ipa.inner_product_base * combined_evaluation;
+
+        let public = domain.evaluate_all_lagrange_coefficients(evaluation_point);
+        let IPAVerifierOutput {
+            h0,
+            public0,
+            lr_sum,
+        } = verify_ipa(&plonk_params.ipa.h, sponge, public, lr);
+
+        let schnorr_bases = Self::schnorr_bases(
+            h0.into_affine(),
+            public0,
+            plonk_params.ipa.inner_product_base,
+            plonk_params.ipa.blinder_base,
+        );
+
+        schnorr.verify(
+            eval_commitment + combined_poly + lr_sum,
+            &schnorr_bases,
+            sponge,
+        )
     }
 }
 
@@ -863,7 +1159,7 @@ impl<P: GLVConfig> EvaluationIPA<P> {
         sponge: &mut S,
         rng: &mut R,
     ) -> Self {
-        let b = P::ScalarField::from_bigint((1u64 << LIMB_SIZE).into()).unwrap();
+        let b = P::ScalarField::from_bigint((1u64 << NON_FINAL_LIMB_SIZE).into()).unwrap();
         let num_parties = public_keys.len();
 
         // r = sum_ij b^j r_jk
@@ -884,8 +1180,6 @@ impl<P: GLVConfig> EvaluationIPA<P> {
             combined_public_key,
             ipa_params.blinder_base,
         );
-
-        println!("P eval schnorr_bases {schnorr_bases:?}");
 
         let schnorr_s = [ipa.a0, r, polynomial_blinder + ipa.blinder];
         // exists r.
@@ -916,7 +1210,7 @@ impl<P: GLVConfig> EvaluationIPA<P> {
     ) -> bool {
         let Self { lr, schnorr } = &self;
 
-        let b = P::ScalarField::from_bigint((1u64 << LIMB_SIZE).into()).unwrap();
+        let b = P::ScalarField::from_bigint((1u64 << NON_FINAL_LIMB_SIZE).into()).unwrap();
         let num_parties = public_keys.len();
 
         // combined_commitment = sum_ij alpha^i b^j C_ijk
@@ -938,10 +1232,6 @@ impl<P: GLVConfig> EvaluationIPA<P> {
 
             <Projective<P> as VariableBaseMSM>::msm(&bases, &scalars).unwrap()
         };
-        if k == 0 && public_keys.len() == 1 {
-            let comm = combined_commitment.into_affine();
-            println!("V comm {comm:?}");
-        }
 
         let IPAVerifierOutput {
             h0,
@@ -967,8 +1257,6 @@ impl<P: GLVConfig> EvaluationIPA<P> {
             combined_public_key,
             ipa_params.blinder_base,
         );
-
-        println!("V eval schnorr_bases {schnorr_bases:?}");
 
         schnorr.verify(
             combined_commitment + polynomial + lr_sum,
@@ -1032,7 +1320,7 @@ impl<P: GLVConfig> BitpackingIPA<P> {
             sponge,
             rng,
             // Don't really need to clone this
-            bits.bits.clone(),
+            bits.coeffs.clone(),
             chals.bit_packing_coefficients(num_parties),
         );
 
@@ -1148,7 +1436,7 @@ struct IPAVerifierOutput<P: SWCurveConfig> {
     public0: P::ScalarField,
 }
 
-pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
+fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
     h: &[Affine<P>],
     sponge: &mut S,
     mut public: Vec<P::ScalarField>,
@@ -1163,7 +1451,6 @@ pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
     let padding = (1 << log2(public.len())) as usize - public.len();
     public.extend((0..padding).map(|_| P::ScalarField::zero()));
 
-    let mut idx = 0;
     for (l, r) in lr.iter() {
         let m = public.len() / 2;
 
@@ -1176,11 +1463,6 @@ pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
 
         chals.push(x_inv);
 
-        /*
-                println!("V m {m}");
-                println!("V public0 {idx} = {:?}", public[0]);
-                println!("V publicm {idx} = {:?}", public[m]);
-        */
         for i in 0..m {
             public[i] = public[i] + x_inv * public[m + i];
         }
@@ -1190,7 +1472,6 @@ pub fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
         scalars.push(x);
         bases.push(*r);
         scalars.push(x_inv);
-        idx += 1;
     }
 
     let public0 = public[0];
@@ -1217,17 +1498,14 @@ impl<P: GLVConfig> IPAParams<P> {
         let mut lr = vec![];
 
         // pad
-        assert_eq!(a.len(), public.len());
+        // assert_eq!(a.len(), public.len());
         let ceil_pow2 = 1 << log2(a.len());
-        // println!("{} {} {}", a.len(), ceil_pow2, self.h.len());
         assert!(self.h.len() >= ceil_pow2);
         let mut h = self.h[..ceil_pow2].to_vec();
-        // println!("P h len {}", h.len());
         let padding = (1 << log2(a.len())) as usize - a.len();
         a.extend((0..padding).map(|_| P::ScalarField::zero()));
         public.extend((0..padding).map(|_| P::ScalarField::zero()));
 
-        let mut idx = 0;
         let mut x_invs = vec![];
         while a.len() > 1 {
             let m = a.len() / 2;
@@ -1257,11 +1535,6 @@ impl<P: GLVConfig> IPAParams<P> {
 
             blinder += x * l_blinder + x_inv * r_blinder;
 
-            /*
-                        println!("P m {m}");
-                        println!("P public0 {idx} = {:?}", public[0]);
-                        println!("P publicm {idx} = {:?}", public[m]);
-            */
             for i in 0..m {
                 a[i] = a[i] + x * a[m + i];
                 public[i] = public[i] + x_inv * public[m + i];
@@ -1271,7 +1544,6 @@ impl<P: GLVConfig> IPAParams<P> {
             public.truncate(m);
 
             h = affine_window_combine_one_endo(P::ENDO_COEFFS[0], &h[..m], &h[m..], &x_inv_bits);
-            idx += 1;
         }
 
         IPAProverOutput {
