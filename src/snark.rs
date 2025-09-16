@@ -31,9 +31,6 @@
 // Combine the Bij into a single column and do a polynomial division check to show bits and an
 // inner product to link with the limbs
 
-use core::num;
-use std::{str::FromStr, time::Instant};
-
 use ark_crypto_primitives::sponge::{self, CryptographicSponge};
 use ark_ec::{
     AffineRepr, CurveGroup, ScalarMul, VariableBaseMSM,
@@ -48,23 +45,28 @@ use ark_poly::{
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{iterable::Iterable, log2, rand::RngCore};
 use array_init::array_init;
+use core::num;
 use itertools::{Itertools, assert_equal};
 use rand::random;
 use rayon::{array, prelude::*};
+use serde::de;
 use sha2::digest::{
     generic_array::arr,
     typenum::{Bit, bit},
 };
+use std::{str::FromStr, time::Instant};
 use tiny_keccak::{Hasher, Shake};
 
 use crate::{
     combine::{
-        self, affine_window_combine_one_endo, batch_add_assign_no_branch, batch_glv_mul,
+        affine_window_combine_one_endo, batch_add_assign_no_branch, batch_glv_mul,
         batch_negate_in_place,
     },
     dlog_table::DLogTable,
     ipa::{self, endoscalar_to_field, pows},
+    schnorr::Schnorr,
     sponge::ShakeSponge,
+    utils::absorb_curve,
 };
 
 const LIMBS: usize = 16;
@@ -162,16 +164,6 @@ pub struct SinglePartyEncryptedShares<'a, G> {
     pub randomness: &'a [[G; 2]; LIMBS],
     // By limb, then by row
     pub by_limb: &'a [[G; 2]; LIMBS],
-}
-
-struct InputColumns<C> {
-    // First by party, then by limb
-    by_party: Vec<[C; LIMBS]>,
-}
-
-struct ProofColumns<C> {
-    lookup_accumulator: Vec<C>,
-    lookup_counts: C,
 }
 
 struct EvaluationIPA<P: SWCurveConfig> {
@@ -734,41 +726,6 @@ pub struct PolynomialCommitmentIPAParams<P: SWCurveConfig> {
 pub struct PolynomialCommitmentIPA<G> {
     lr: Vec<(G, G)>,
     schnorr: (),
-}
-
-pub struct Schnorr<const N: usize, P: SWCurveConfig> {
-    z: [P::ScalarField; N],
-    rg: Affine<P>,
-}
-
-impl<const N: usize, P: SWCurveConfig> Schnorr<N, P> {
-    fn verify<S: CryptographicSponge>(
-        &self,
-        comm: Projective<P>,
-        g: &[Affine<P>],
-        sponge: &mut S,
-    ) -> bool {
-        absorb_curve(sponge, &self.rg);
-        let c = sponge.squeeze_field_elements::<P::ScalarField>(1)[0];
-        let zg = <Projective<P> as VariableBaseMSM>::msm(&g, &self.z).unwrap();
-        comm * c + self.rg == zg
-    }
-
-    fn prove<R: RngCore, S: CryptographicSponge>(
-        g: &[Affine<P>],
-        s: &[P::ScalarField],
-        sponge: &mut S,
-        rng: &mut R,
-    ) -> Self {
-        let r: [_; N] = array_init(|_| P::ScalarField::rand(rng));
-        let rg = <Projective<P> as VariableBaseMSM>::msm(&g, &r)
-            .unwrap()
-            .into_affine();
-        absorb_curve(sponge, &rg);
-        let c = sponge.squeeze_field_elements::<P::ScalarField>(1)[0];
-        let z = array_init(|i| c * s[i] + r[i]);
-        Self { rg, z }
-    }
 }
 
 // TODO: Replace with nice group map
@@ -1407,16 +1364,6 @@ impl<P: GLVConfig> BitPackingIPAParams<P> {
 
 }
     } */
-
-fn absorb_curve<P: SWCurveConfig, S: CryptographicSponge>(sponge: &mut S, g: &Affine<P>) {
-    let (x, y) = g.xy().unwrap();
-    let mut buf = vec![0; P::BaseField::uncompressed_size(&x)];
-    x.serialize_uncompressed(&mut buf).ok();
-    sponge.absorb(&buf);
-    buf.iter_mut().for_each(|x| *x = 0);
-    y.serialize_uncompressed(&mut buf).ok();
-    sponge.absorb(&buf);
-}
 
 fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     a.iter().zip(b.iter()).map(|(x, y)| *x * y).sum()
