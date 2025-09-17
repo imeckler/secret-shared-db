@@ -31,9 +31,9 @@
 // Combine the Bij into a single column and do a polynomial division check to show bits and an
 // inner product to link with the limbs
 
-use ark_crypto_primitives::sponge::{self, CryptographicSponge};
+use ark_crypto_primitives::sponge::CryptographicSponge;
 use ark_ec::{
-    AffineRepr, CurveGroup, ScalarMul, VariableBaseMSM,
+    AffineRepr, CurveGroup, VariableBaseMSM,
     scalar_mul::{BatchMulPreprocessing, glv::GLVConfig},
     short_weierstrass::{Affine, Projective, SWCurveConfig},
 };
@@ -42,26 +42,13 @@ use ark_poly::{
     DenseUVPolynomial, EvaluationDomain, Evaluations, Polynomial, Radix2EvaluationDomain,
     univariate::DensePolynomial,
 };
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{iterable::Iterable, log2, rand::RngCore};
 use array_init::array_init;
-use core::num;
-use itertools::{Itertools, assert_equal};
-use rand::random;
-use rayon::{array, prelude::*};
-use serde::de;
-use sha2::digest::{
-    generic_array::arr,
-    typenum::{Bit, bit},
-};
-use std::{str::FromStr, time::Instant};
-use tiny_keccak::{Hasher, Shake};
+use itertools::Itertools;
+use rayon::prelude::*;
 
 use crate::{
-    combine::{
-        affine_window_combine_one_endo, batch_add_assign_no_branch, batch_glv_mul,
-        batch_negate_in_place,
-    },
+    combine::{batch_add_assign_no_branch, batch_glv_mul, batch_negate_in_place},
     dlog_table::DLogTable,
     ipa,
     pows::pows,
@@ -278,7 +265,6 @@ impl<P: GLVConfig> EncryptedSharesWithProof<P> {
                 threshold,
                 chals.alpha,
                 &self.shares,
-                encryption_params,
                 public_keys,
                 combined_public_key,
                 sponge,
@@ -621,7 +607,6 @@ pub fn encrypt<'a, R: RngCore, P: GLVConfig + SWCurveConfig>(
             k,
             chals.alpha,
             &rs,
-            params,
             public_keys,
             combined_public_key,
             sponge,
@@ -704,36 +689,6 @@ impl<'a, P: SWCurveConfig> PLONKIPAParams<'a, P> {
             domain2,
         }
     }
-}
-
-/*
-pub struct BitPackingIPAParams<P: SWCurveConfig> {
-    pub ipa: IPAParams<P>,
-    num_parties: usize,
-}
-*/
-
-pub struct PolynomialCommitmentIPAParams<P: SWCurveConfig> {
-    ipa: ipa::Params<P>,
-}
-
-pub struct PolynomialCommitmentIPA<G> {
-    lr: Vec<(G, G)>,
-    schnorr: (),
-}
-
-fn commitment_key_scalars<F: Field>(chals: &[F]) -> Vec<F> {
-    let rounds = chals.len();
-    let s_length = 1 << rounds;
-    let mut s = vec![F::one(); s_length];
-    let mut k: usize = 0;
-    let mut pow: usize = 1;
-    for i in 1..s_length {
-        k += if i == pow { 1 } else { 0 };
-        pow <<= if i == pow { 1 } else { 0 };
-        s[i] = s[i - (pow >> 1)] * chals[rounds - 1 - (k - 1)];
-    }
-    s
 }
 
 impl<P: GLVConfig> BooleanityProof<P> {
@@ -1071,8 +1026,7 @@ impl<P: GLVConfig> EvaluationIPA<P> {
         k: usize,
         alpha: P::ScalarField,
         encryption_randomness: &[[P::ScalarField; 2]; LIMBS],
-        encryption_params: &EncryptionParams<Affine<P>>,
-        public_keys: &Vec<Affine<P>>,
+        public_keys: &[Affine<P>],
         combined_public_key: Affine<P>,
         sponge: &mut S,
         rng: &mut R,
@@ -1119,7 +1073,6 @@ impl<P: GLVConfig> EvaluationIPA<P> {
         threshold: usize,
         alpha: P::ScalarField,
         encrypted_shares: &EncryptedShares<P>,
-        encryption_params: &EncryptionParams<Affine<P>>,
         public_keys: &[Affine<P>],
         combined_public_key: Affine<P>,
         sponge: &mut S,
@@ -1211,10 +1164,6 @@ impl<P: GLVConfig> BitpackingIPA<P> {
         bits: &BitsWithCommitment<P>,
         sponge: &mut S,
         rng: &mut R,
-        /*
-                shares: &ShareLimbs,
-                encrypted_shares: &EncryptedShares<P>,
-        */
     ) -> BitpackingIPA<P> {
         // TODO: Use a batch affine version if efficiency is needed.
         // let chals = encrypted_shares.challenges(sponge);
@@ -1275,7 +1224,6 @@ impl<P: GLVConfig> BitpackingIPA<P> {
         num_parties: usize,
         combined_public_key: Affine<P>,
         chals: &Challenges<P>,
-        // c_0: Projective<P>,
     ) -> bool {
         let Self {
             bit_commitment,
@@ -1311,21 +1259,4 @@ impl<P: GLVConfig> BitpackingIPA<P> {
 
         schnorr.verify(c_0 + lr_sum, &schnorr_bases, sponge)
     }
-}
-
-/*
-impl<P: GLVConfig> BitPackingIPAParams<P> {
-    pub fn new(num_parties: usize) -> Self {
-        let prefix = b"bit_packing_ipa_param";
-        let num_bits = 1 << log2(num_parties * SECRETS * LIMBS * LIMB_SIZE);
-        BitPackingIPAParams {
-            ipa: IPAParams::new(prefix, num_bits),
-            num_parties,
-        }
-
-}
-    } */
-
-fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
-    a.iter().zip(b.iter()).map(|(x, y)| *x * y).sum()
 }
