@@ -63,7 +63,8 @@ use crate::{
         batch_negate_in_place,
     },
     dlog_table::DLogTable,
-    ipa::{self, endoscalar_to_field, pows},
+    ipa,
+    pows::pows,
     schnorr::Schnorr,
     sponge::ShakeSponge,
     utils::absorb_curve,
@@ -96,7 +97,7 @@ impl<F: PrimeField> SharePolynomials<F> {
     fn commitments<P: SWCurveConfig<ScalarField = F>, R: RngCore>(
         &self,
         rng: &mut R,
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
     ) -> [(Affine<P>, F); SECRETS] {
         array_init(|i| {
             let r: F = F::rand(rng);
@@ -417,7 +418,7 @@ struct BitsWithCommitment<P: SWCurveConfig> {
 impl ShareLimbs {
     fn bits_with_commitment<P: GLVConfig, R: RngCore>(
         &self,
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         rng: &mut R,
     ) -> BitsWithCommitment<P> {
         let num_parties = self.per_party.len();
@@ -681,22 +682,15 @@ pub struct BitpackingIPA<P: SWCurveConfig> {
     schnorr: Schnorr<3, P>,
 }
 
-pub struct IPAParams<P: SWCurveConfig> {
-    h: Vec<Affine<P>>,
-    blinder_base: Affine<P>,
-    // Has to be the same as the encryption base
-    pub inner_product_base: Affine<P>,
-}
-
 pub struct PLONKIPAParams<'a, P: SWCurveConfig> {
-    ipa: &'a IPAParams<P>,
+    ipa: &'a ipa::Params<P>,
     // monomial_basis: Vec<Affine<P>>,
     domain: Radix2EvaluationDomain<P::ScalarField>,
     domain2: Radix2EvaluationDomain<P::ScalarField>,
 }
 
 impl<'a, P: SWCurveConfig> PLONKIPAParams<'a, P> {
-    pub fn new(ipa: &'a IPAParams<P>, column_size: usize) -> Self {
+    pub fn new(ipa: &'a ipa::Params<P>, column_size: usize) -> Self {
         let domain = Radix2EvaluationDomain::<P::ScalarField>::new(column_size).unwrap();
         let domain2 = Radix2EvaluationDomain::<P::ScalarField>::new(2 * domain.size()).unwrap();
         assert_eq!(domain.group_gen, domain2.group_gen.square());
@@ -720,31 +714,12 @@ pub struct BitPackingIPAParams<P: SWCurveConfig> {
 */
 
 pub struct PolynomialCommitmentIPAParams<P: SWCurveConfig> {
-    ipa: IPAParams<P>,
+    ipa: ipa::Params<P>,
 }
 
 pub struct PolynomialCommitmentIPA<G> {
     lr: Vec<(G, G)>,
     schnorr: (),
-}
-
-// TODO: Replace with nice group map
-pub fn random_group_element<P: SWCurveConfig>(prefix: &[u8], i: u64) -> Affine<P> {
-    let mut j: u32 = 0;
-    loop {
-        let mut hash = [0u8; 32];
-        let mut sponge = Shake::v256();
-        sponge.update(prefix);
-        sponge.update(&i.to_le_bytes());
-        sponge.update(&j.to_le_bytes());
-        sponge.finalize(&mut hash);
-
-        let x = P::BaseField::from_random_bytes(&hash);
-        match x.and_then(|x| Affine::<P>::get_point_from_x_unchecked(x, false)) {
-            None => j += 1,
-            Some(p) => return p,
-        }
-    }
 }
 
 fn commitment_key_scalars<F: Field>(chals: &[F]) -> Vec<F> {
@@ -759,20 +734,6 @@ fn commitment_key_scalars<F: Field>(chals: &[F]) -> Vec<F> {
         s[i] = s[i - (pow >> 1)] * chals[rounds - 1 - (k - 1)];
     }
     s
-}
-
-impl<P: SWCurveConfig + GLVConfig> IPAParams<P> {
-    pub fn new(prefix: &[u8], n: usize) -> Self {
-        let n = 1 << log2(n);
-        let h = (0..n).map(|i| random_group_element(prefix, i)).collect();
-        let blinder_base = random_group_element(prefix, n);
-        let inner_product_base = random_group_element(prefix, n + 1);
-        IPAParams {
-            h,
-            blinder_base,
-            inner_product_base,
-        }
-    }
 }
 
 impl<P: GLVConfig> BooleanityProof<P> {
@@ -960,11 +921,11 @@ impl<P: GLVConfig> BooleanityProof<P> {
         let eval_commitment = plonk_params.ipa.inner_product_base * combined_evaluation;
 
         let public = domain.evaluate_all_lagrange_coefficients(evaluation_point);
-        let IPAVerifierOutput {
+        let ipa::VerifierOutput {
             h0,
             public0,
             lr_sum,
-        } = verify_ipa(&plonk_params.ipa.h, sponge, public, lr);
+        } = ipa::verify(&plonk_params.ipa.h, sponge, public, lr);
 
         let schnorr_bases = Self::schnorr_bases(
             h0.into_affine(),
@@ -995,7 +956,7 @@ impl<P: GLVConfig> SimpleEvaluationIPA<P> {
     }
 
     pub fn create<R: RngCore, S: CryptographicSponge>(
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         polynomial: &DensePolynomial<P::ScalarField>,
         polynomial_blinder: P::ScalarField,
         evaluation_point: P::ScalarField,
@@ -1026,7 +987,7 @@ impl<P: GLVConfig> SimpleEvaluationIPA<P> {
 
     pub fn verify<S: CryptographicSponge>(
         &self,
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         polynomial: Affine<P>,
         degree: usize,
         evaluation_point: P::ScalarField,
@@ -1039,11 +1000,11 @@ impl<P: GLVConfig> SimpleEvaluationIPA<P> {
 
         let combined_commitment = ipa_params.inner_product_base * evaluation;
 
-        let IPAVerifierOutput {
+        let ipa::VerifierOutput {
             h0,
             public0,
             lr_sum,
-        } = verify_ipa(
+        } = ipa::verify(
             &ipa_params.h,
             sponge,
             pows(evaluation_point).take(degree + 1).collect_vec(),
@@ -1104,7 +1065,7 @@ impl<P: GLVConfig> EvaluationIPA<P> {
     }
 
     pub fn create<R: RngCore, S: CryptographicSponge>(
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         polynomial: &DensePolynomial<P::ScalarField>,
         polynomial_blinder: P::ScalarField,
         k: usize,
@@ -1152,7 +1113,7 @@ impl<P: GLVConfig> EvaluationIPA<P> {
 
     pub fn verify<S: CryptographicSponge>(
         &self,
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         polynomial: Affine<P>,
         k: usize,
         threshold: usize,
@@ -1190,11 +1151,11 @@ impl<P: GLVConfig> EvaluationIPA<P> {
             <Projective<P> as VariableBaseMSM>::msm(&bases, &scalars).unwrap()
         };
 
-        let IPAVerifierOutput {
+        let ipa::VerifierOutput {
             h0,
             public0,
             lr_sum,
-        } = verify_ipa(
+        } = ipa::verify(
             &ipa_params.h,
             sponge,
             Self::combined_powers(num_parties, k, threshold - 1, alpha),
@@ -1241,7 +1202,7 @@ impl<P: GLVConfig> BitpackingIPA<P> {
     }
 
     fn create<R: RngCore, S: CryptographicSponge>(
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         encryption_randomness: &[[P::ScalarField; 2]; LIMBS],
         encryption_params: &EncryptionParams<Affine<P>>,
         num_parties: usize,
@@ -1307,7 +1268,7 @@ impl<P: GLVConfig> BitpackingIPA<P> {
 
     fn verify<S: CryptographicSponge>(
         &self,
-        ipa_params: &IPAParams<P>,
+        ipa_params: &ipa::Params<P>,
         encryption_params: &EncryptionParams<Affine<P>>,
         sponge: &mut S,
         encrypted_shares: &EncryptedShares<P>,
@@ -1326,11 +1287,11 @@ impl<P: GLVConfig> BitpackingIPA<P> {
 
         let public = chals.bit_packing_coefficients(num_parties);
 
-        let IPAVerifierOutput {
+        let ipa::VerifierOutput {
             h0,
             public0,
             lr_sum,
-        } = verify_ipa(&ipa_params.h, sponge, public, lr);
+        } = ipa::verify(&ipa_params.h, sponge, public, lr);
 
         // Check lr_sum + c_0 == ()
         // Need to verify knowledge of a, s, t  such that
@@ -1367,138 +1328,4 @@ impl<P: GLVConfig> BitPackingIPAParams<P> {
 
 fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     a.iter().zip(b.iter()).map(|(x, y)| *x * y).sum()
-}
-
-struct IPAProverOutput<P: SWCurveConfig> {
-    lr: Vec<(Affine<P>, Affine<P>)>,
-    h0: Affine<P>,
-    a0: P::ScalarField,
-    public0: P::ScalarField,
-    blinder: P::ScalarField,
-}
-
-struct IPAVerifierOutput<P: SWCurveConfig> {
-    h0: Projective<P>,
-    lr_sum: Projective<P>,
-    public0: P::ScalarField,
-}
-
-fn verify_ipa<P: GLVConfig, S: CryptographicSponge>(
-    h: &[Affine<P>],
-    sponge: &mut S,
-    mut public: Vec<P::ScalarField>,
-    lr: &[(Affine<P>, Affine<P>)],
-) -> IPAVerifierOutput<P> {
-    let mut bases = vec![];
-    let mut scalars = vec![];
-    let mut chals = vec![];
-
-    let ceil_pow2 = 1 << log2(public.len());
-    assert!(h.len() >= ceil_pow2);
-    let padding = (1 << log2(public.len())) as usize - public.len();
-    public.extend((0..padding).map(|_| P::ScalarField::zero()));
-
-    for (l, r) in lr.iter() {
-        let m = public.len() / 2;
-
-        absorb_curve(sponge, l);
-        absorb_curve(sponge, r);
-
-        let x_inv_bits = sponge.squeeze_bits(128);
-        let x_inv = endoscalar_to_field::<P>(&x_inv_bits[..]);
-        let x = x_inv.inverse().unwrap();
-
-        chals.push(x_inv);
-
-        for i in 0..m {
-            public[i] = public[i] + x_inv * public[m + i];
-        }
-        public.truncate(m);
-
-        bases.push(*l);
-        scalars.push(x);
-        bases.push(*r);
-        scalars.push(x_inv);
-    }
-
-    let public0 = public[0];
-
-    let ck_scalars = commitment_key_scalars(&chals);
-    IPAVerifierOutput {
-        lr_sum: <Projective<P> as VariableBaseMSM>::msm(&bases, &scalars).unwrap(),
-        h0: VariableBaseMSM::msm(&h[..ck_scalars.len()], &ck_scalars).unwrap(),
-        public0,
-    }
-}
-
-impl<P: GLVConfig> IPAParams<P> {
-    fn prove<R: RngCore, S: CryptographicSponge>(
-        &self,
-        sponge: &mut S,
-        rng: &mut R,
-        mut a: Vec<P::ScalarField>,
-        mut public: Vec<P::ScalarField>,
-    ) -> IPAProverOutput<P> {
-        let mut sponge_clone = sponge.clone();
-
-        let mut blinder = P::ScalarField::zero();
-        let mut lr = vec![];
-
-        // pad
-        // assert_eq!(a.len(), public.len());
-        let ceil_pow2 = 1 << log2(a.len());
-        assert!(self.h.len() >= ceil_pow2);
-        let mut h = self.h[..ceil_pow2].to_vec();
-        let padding = (1 << log2(a.len())) as usize - a.len();
-        a.extend((0..padding).map(|_| P::ScalarField::zero()));
-        public.extend((0..padding).map(|_| P::ScalarField::zero()));
-
-        let mut x_invs = vec![];
-        while a.len() > 1 {
-            let m = a.len() / 2;
-            let l_blinder = P::ScalarField::rand(rng);
-            let r_blinder = P::ScalarField::rand(rng);
-            let z_l = inner_product(&a[m..], &public[..m]);
-            let z_r = inner_product(&a[..m], &public[m..]);
-
-            let l = <Projective<P> as VariableBaseMSM>::msm(&h[..m], &a[m..]).unwrap()
-                + self.blinder_base * l_blinder
-                + self.inner_product_base * z_l;
-            let r = <Projective<P> as VariableBaseMSM>::msm(&h[m..], &a[..m]).unwrap()
-                + self.blinder_base * r_blinder
-                + self.inner_product_base * z_r;
-            let l = l.into_affine();
-            let r = r.into_affine();
-            absorb_curve(sponge, &l);
-            absorb_curve(sponge, &r);
-            // make 0 knowledge
-            lr.push((l, r));
-
-            let x_inv_bits = sponge.squeeze_bits(128);
-            let x_inv = endoscalar_to_field::<P>(&x_inv_bits[..]);
-            let x = x_inv.inverse().unwrap();
-
-            x_invs.push(x_inv);
-
-            blinder += x * l_blinder + x_inv * r_blinder;
-
-            for i in 0..m {
-                a[i] = a[i] + x * a[m + i];
-                public[i] = public[i] + x_inv * public[m + i];
-            }
-
-            a.truncate(m);
-            public.truncate(m);
-
-            h = affine_window_combine_one_endo(P::ENDO_COEFFS[0], &h[..m], &h[m..], &x_inv_bits);
-        }
-
-        IPAProverOutput {
-            h0: h[0],
-            a0: a[0],
-            public0: public[0],
-            lr,
-            blinder,
-        }
-    }
 }

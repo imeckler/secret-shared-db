@@ -10,7 +10,9 @@ use ark_ff::{BigInteger, Field, PrimeField, UniformRand, batch_inversion};
 use ark_pallas::{Affine, Fr, PallasConfig, Projective};
 use ark_std::rand::{RngCore, SeedableRng, rngs::StdRng};
 use combine::batch_glv_mul;
+use core::num;
 use dlog_table::DLogTable;
+use ipa::random_group_element;
 use itertools::Itertools;
 use lagrange::LagrangePreprocessed;
 use rayon::prelude::*;
@@ -20,16 +22,15 @@ mod combine;
 mod dlog_table;
 mod ipa;
 mod lagrange;
+mod pows;
+mod schnorr;
+mod utils;
 // mod schnorr;
 mod epoch;
-mod secret_sharing;
 mod signature;
 mod snark;
 mod sponge;
-use ipa::{Commitment, CommitmentKey, pows};
-use secret_sharing::{
-    EncryptionParams, ShareLimbs, Shares, SinglePartyEncryptedShares, decrypt, encrypt,
-};
+// use ipa::{Commitment, CommitmentKey, pows};
 use sponge::ShakeSponge;
 
 type NodeId = usize;
@@ -141,15 +142,20 @@ fn main() {
     use crate::snark::*;
 
     let num_parties = 5;
+    // Need 3 or more to decrypt
     let threshold = 3;
     let encryption_params = EncryptionParams {
         public_key_base: random_group_element(b"public_key_base", 0),
     };
-    let bitpacking_ipa_params = BitPackingIPAParams::new(num_parties);
+    let num_bits = num_parties * 256 * 2;
+    println!("num bits {num_bits}");
+    let ipa_params = ipa::Params::new(b"ipa", num_bits);
+    let plonk_params = PLONKIPAParams::new(&ipa_params, num_bits);
 
-    let dlog_table = DLogTable::create(bitpacking_ipa_params.ipa.inner_product_base);
+    let dlog_table = DLogTable::create(ipa_params.inner_product_base);
 
-    let shares = Shares::<Fr>::create(&mut rng, num_parties, threshold);
+    let share_polynomials = SharePolynomials::<Fr>::create(&mut rng, threshold);
+    let shares = share_polynomials.shares(num_parties);
 
     let secret_keys = (0..num_parties).map(|_| Fr::rand(&mut rng)).collect_vec();
     let public_keys = secret_keys
@@ -161,9 +167,9 @@ fn main() {
     let start = Instant::now();
     let encrypted_with_proof = encrypt(
         &encryption_params,
-        &bitpacking_ipa_params,
+        &plonk_params,
         &dlog_table,
-        &shares.to_limbs(),
+        &share_polynomials,
         &public_keys,
         &mut rng,
     );
@@ -175,11 +181,12 @@ fn main() {
         let decrypted = encrypted_with_proof
             .decrypt_and_verify(
                 &encryption_params,
-                &bitpacking_ipa_params,
+                &plonk_params,
                 &dlog_table,
                 secret_keys[i],
                 i,
                 &public_keys,
+                threshold,
             )
             .unwrap();
         println!("decryption/verifying {:?}", start.elapsed());
