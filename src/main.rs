@@ -1,37 +1,20 @@
-use ark_crypto_primitives::sponge::{
-    CryptographicSponge,
-    poseidon::{PoseidonDefaultConfig, PoseidonSponge},
-};
-use ark_ec::{
-    AdditiveGroup, AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM, pairing::Pairing,
-    scalar_mul::glv::GLVConfig, short_weierstrass::SWCurveConfig,
-};
-use ark_ff::{BigInteger, Field, PrimeField, UniformRand, batch_inversion};
-use ark_pallas::{Affine, Fr, PallasConfig, Projective};
-use ark_std::rand::{RngCore, SeedableRng, rngs::StdRng};
-use combine::batch_glv_mul;
-use core::num;
+use ark_ec::CurveGroup;
+use ark_ff::UniformRand;
+use ark_pallas::{Fr, Projective};
+use ark_std::rand::SeedableRng;
 use dlog_table::DLogTable;
 use ipa::random_group_element;
 use itertools::Itertools;
-use lagrange::LagrangePreprocessed;
-use rayon::prelude::*;
-use sha2::digest::typenum::bit;
 use std::collections::HashMap;
 mod combine;
 mod dlog_table;
+mod epoch;
 mod ipa;
-mod lagrange;
 mod pows;
 mod schnorr;
-mod utils;
-// mod schnorr;
-mod epoch;
-mod signature;
-mod snark;
 mod sponge;
-// use ipa::{Commitment, CommitmentKey, pows};
-use sponge::ShakeSponge;
+mod utils;
+mod vss;
 
 type NodeId = usize;
 
@@ -139,7 +122,7 @@ fn usize_to_seed(x: usize) -> [u8; 32] {
 fn main() {
     use std::time::Instant;
     let mut rng = ark_std::rand::rngs::StdRng::from_seed([0; 32]);
-    use crate::snark::*;
+    use crate::vss::*;
 
     let num_parties = 5;
     // Need 3 or more to decrypt
